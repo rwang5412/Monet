@@ -345,6 +345,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.latent_state: dict[str, dict[str, Any]] = {}
         self.latent_size = latent_size
 
+        # --- CapImagine do(Z) latent-intervention hook (capture / corrupt) ---
+        # Configured via MONET_LATENT_MODE / MONET_LATENT_STATS env vars; a
+        # no-op pass-through when MONET_LATENT_MODE is unset ("off").
+        # A construction failure is fatal when a mode is explicitly requested
+        # (otherwise a bad config silently degrades to plain inference and
+        # produces meaningless Delta=0 results); fail-safe only when unset/off.
+        _requested = os.getenv("MONET_LATENT_MODE", "off").strip().lower()
+        try:
+            from inference.vllm.monet_latent_hook import get_hook
+            self.latent_hook = get_hook()
+        except Exception as e:
+            if _requested not in ("", "off"):
+                raise
+            print(f"[MonetLatentHook] disabled ({e!r})")
+            self.latent_hook = None
+
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         """
         Update the order of requests in the batch based on the attention
@@ -1662,7 +1678,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # If currently active, set pending for next step from this step's last position
                 if st["active"] and last_token_h is not None and i < last_token_h.shape[0]:
                     # store a detached 1D tensor [H]
-                    st["pending"] = last_token_h[i].detach()
+                    pending = last_token_h[i].detach()
+                    # CapImagine do(Z): capture clean latents or corrupt them.
+                    if self.latent_hook is not None and self.latent_hook.active:
+                        pending = self.latent_hook.process(pending)
+                    st["pending"] = pending
                     st["current_len"] +=1
 
         # Cache the sampled tokens in the model runner, so that the scheduler
