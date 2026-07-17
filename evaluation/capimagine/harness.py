@@ -32,10 +32,33 @@ SYSTEM_PROMPT = (
     "You are a helpful multimodal assistant. You are required to answer the "
     "question based on the image provided. Put your final answer in \\boxed{}."
 )
+# Exact RL training prompt: RL/examples/format_prompt/monet_format.jinja, wired in
+# via RL/examples/config_monet.yaml. verl appends this suffix inline to the user
+# question and leaves the system prompt at the template default ("You are a helpful
+# assistant."). Both SFT (src/task.py) and RL trained on the default system, so a
+# custom system role is off-distribution and suppresses latent emission on the RL
+# model. The literal "\n"/"\boxed" match what verl's Template.render actually emits.
+MONET_FORMAT_SUFFIX = (
+    " You FIRST think about the reasoning process as an internal monologue and then "
+    "provide the final answer.\\nRemember: 1. Solve the problem step by step.\\n2. You "
+    "MUST put the final answer in \\boxed{}."
+)
 LATENT_START_ID = 151666
 
 
-def _build_messages(samples):
+def _build_messages(samples, prompt_style="monet"):
+    if prompt_style == "monet":
+        # In-distribution: default system prompt, training suffix inline in the user turn.
+        return [
+            [
+                {"role": "user", "content": [
+                    {"type": "text", "text": s.question + MONET_FORMAT_SUFFIX},
+                    {"type": "image", "image": s.image},
+                ]},
+            ]
+            for s in samples
+        ]
+    # legacy: custom system role (off-distribution; kept only for comparison).
     return [
         [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -82,7 +105,8 @@ def run(args):
         temperature=0.0, max_tokens=args.max_tokens, n=1,
         skip_special_tokens=False, seed=0)
 
-    inputs = vllm_mllm_process_batch_from_messages(_build_messages(samples), processor)
+    inputs = vllm_mllm_process_batch_from_messages(
+        _build_messages(samples, args.prompt_style), processor)
     outputs = vllm_generate(inputs, sampling_params, mllm)
 
     # Flush the final capture stats (the runner dumps periodically during the run).
@@ -171,6 +195,9 @@ def main():
     ap.add_argument("--dataset", required=True, choices=["vstar", "hrbench_4k"])
     ap.add_argument("--mode", required=True,
                     choices=["clean", "corrupt_gauss", "corrupt_mean"])
+    ap.add_argument("--prompt-style", default="monet", choices=["monet", "legacy"],
+                    help="monet = RL training prompt (default, in-distribution); "
+                         "legacy = old custom system prompt")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--stats", default=None,
                     help="mu/sigma stats path (default: <out-dir>/<dataset>_stats.pt)")

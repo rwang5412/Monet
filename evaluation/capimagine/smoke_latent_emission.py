@@ -10,7 +10,8 @@ latent-start token (151666) appears. If the rate is ~0, stop and fix the prompt
 import argparse
 import os
 
-from evaluation.capimagine.harness import SYSTEM_PROMPT, LATENT_START_ID
+from evaluation.capimagine.harness import (
+    SYSTEM_PROMPT, MONET_FORMAT_SUFFIX, LATENT_START_ID, _build_messages)
 
 LATENT_END_ID = 151667
 
@@ -23,6 +24,9 @@ def main():
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--gpu-mem", type=float, default=0.85)
     ap.add_argument("--max-model-len", type=int, default=8192)
+    ap.add_argument("--prompt-style", default="monet", choices=["monet", "legacy"],
+                    help="monet = RL training prompt (default, in-distribution); "
+                         "legacy = old custom system prompt")
     ap.add_argument("--latent-size", type=int, default=10)
     args = ap.parse_args()
 
@@ -37,16 +41,7 @@ def main():
     from evaluation.capimagine import datasets
 
     samples = datasets.load(args.dataset, limit=args.limit)
-    messages = [
-        [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "text", "text": s.question},
-                {"type": "image", "image": s.image},
-            ]},
-        ]
-        for s in samples
-    ]
+    messages = _build_messages(samples, args.prompt_style)
 
     mllm, _ = vllm_mllm_init(args.model, tp=args.tp, gpu_memory_utilization=args.gpu_mem,
                              max_model_len=args.max_model_len)
