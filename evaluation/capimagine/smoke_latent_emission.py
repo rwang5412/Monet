@@ -27,6 +27,10 @@ def main():
     ap.add_argument("--prompt-style", default="monet", choices=["monet", "legacy"],
                     help="monet = RL training prompt (default, in-distribution); "
                          "legacy = old custom system prompt")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="0 = greedy (can suppress the latent token); Monet inference "
+                         "uses 0.1, RL rollouts used 0.5. When >0, top_p/top_k match "
+                         "the canonical inference defaults.")
     ap.add_argument("--latent-size", type=int, default=10)
     args = ap.parse_args()
 
@@ -46,8 +50,15 @@ def main():
     mllm, _ = vllm_mllm_init(args.model, tp=args.tp, gpu_memory_utilization=args.gpu_mem,
                              max_model_len=args.max_model_len)
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
-    sp = SamplingParams(temperature=0.0, max_tokens=2048, n=1,
-                        skip_special_tokens=False, seed=0)
+    # Greedy (temp=0) can deterministically starve the "sometimes" latent token.
+    # When sampling, mirror the canonical inference top_p/top_k so emission is realistic.
+    if args.temperature > 0:
+        sp = SamplingParams(temperature=args.temperature, top_p=0.8, top_k=50,
+                            max_tokens=2048, n=1, skip_special_tokens=False, seed=0)
+    else:
+        sp = SamplingParams(temperature=0.0, max_tokens=2048, n=1,
+                            skip_special_tokens=False, seed=0)
+    print(f"[smoke] prompt_style={args.prompt_style} temperature={args.temperature}")
     inputs = vllm_mllm_process_batch_from_messages(messages, processor)
     outputs = vllm_generate(inputs, sp, mllm)
 
