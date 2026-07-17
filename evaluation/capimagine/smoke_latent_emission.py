@@ -22,6 +22,7 @@ def main():
     ap.add_argument("--limit", type=int, default=8)
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--gpu-mem", type=float, default=0.85)
+    ap.add_argument("--max-model-len", type=int, default=8192)
     ap.add_argument("--latent-size", type=int, default=10)
     args = ap.parse_args()
 
@@ -47,7 +48,8 @@ def main():
         for s in samples
     ]
 
-    mllm, _ = vllm_mllm_init(args.model, tp=args.tp, gpu_memory_utilization=args.gpu_mem)
+    mllm, _ = vllm_mllm_init(args.model, tp=args.tp, gpu_memory_utilization=args.gpu_mem,
+                             max_model_len=args.max_model_len)
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
     sp = SamplingParams(temperature=0.0, max_tokens=2048, n=1,
                         skip_special_tokens=False, seed=0)
