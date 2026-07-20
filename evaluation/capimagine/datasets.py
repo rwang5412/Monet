@@ -59,8 +59,19 @@ def _to_pil(v: Any) -> Image.Image:
     if isinstance(v, dict) and "bytes" in v and v["bytes"] is not None:
         import io
         return Image.open(io.BytesIO(v["bytes"])).convert("RGB")
-    if isinstance(v, str):  # path
-        return Image.open(v).convert("RGB")
+    if isinstance(v, str):  # a file path OR a base64-encoded image
+        import os
+        if os.path.exists(v):
+            return Image.open(v).convert("RGB")
+        # HR-Bench stores images as base64-encoded JPEG strings in a string column.
+        import io, base64
+        s = v.split(",", 1)[1] if v.startswith("data:") else v  # strip any data-URI prefix
+        s = "".join(s.split())                                   # drop whitespace/newlines
+        s += "=" * (-len(s) % 4)                                 # fix missing padding
+        try:
+            return Image.open(io.BytesIO(base64.b64decode(s))).convert("RGB")
+        except Exception as e:
+            raise TypeError(f"str image is neither an existing path nor base64: {e!r}")
     raise TypeError(f"Cannot coerce image field of type {type(v)} to PIL")
 
 
