@@ -59,7 +59,10 @@ export HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
 echo "MODEL=$MODEL DATASET=$DATASET OUT_DIR=$OUT_DIR"
 
-for MODE in clean corrupt_gauss corrupt_mean; do
+# MODES lets an accuracy-only repro skip the corruption passes (MODES=clean).
+# Default runs the full do(Z) sequence.
+MODES="${MODES:-clean corrupt_gauss corrupt_mean}"
+for MODE in $MODES; do
   echo "======== mode=$MODE ========"
   # SHELL-export the hook config so it reaches the vLLM WORKER. The Monet runner
   # patch loads via sitecustomize at Python startup, so vLLM snapshots the worker
