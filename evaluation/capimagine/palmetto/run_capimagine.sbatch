@@ -46,7 +46,11 @@ cd "${REPO_DIR:-$SLURM_SUBMIT_DIR}"
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
 # Monet latent config + offline (compute node is air-gapped after login-node cache).
-export LATENT_SIZE=10
+# LATENT_SIZE is the test-time latent count. Default 10 (do(Z) runs). For an
+# accuracy repro, override to 8 (the SFT-trained size; paper sweeps {8,10,12,16}).
+# The value is both shell-exported (so it reaches the vLLM worker) AND passed as
+# --latent-size (harness uses setdefault, so the shell export wins consistently).
+export LATENT_SIZE="${LATENT_SIZE:-10}"
 # Must match the HF_HOME used when the datasets were pre-cached on the DTN,
 # or the offline job below can't find them.
 export HF_HOME="${HF_HOME:-/scratch/$USER/hf}"
@@ -68,6 +72,7 @@ for MODE in clean corrupt_gauss corrupt_mean; do
   python -m evaluation.capimagine.harness \
     --model "$MODEL" --dataset "$DATASET" --mode "$MODE" \
     --out-dir "$OUT_DIR" --tp 1 --prompt-style "$PROMPT_STYLE" \
+    --latent-size "$LATENT_SIZE" \
     --max-model-len "$MAX_MODEL_LEN" --temperature "$TEMPERATURE" $LIMIT_FLAG
 done
 
