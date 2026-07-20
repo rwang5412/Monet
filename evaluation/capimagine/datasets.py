@@ -23,7 +23,7 @@ from PIL import Image
 
 # HF dataset coordinates
 VSTAR = dict(repo="lmms-lab/vstar-bench", config=None, split="test")
-HRBENCH_4K = dict(repo="DreamMr/HR-Bench", config="hrbench_4k", split="test")
+HRBENCH_4K = dict(repo="DreamMr/HR-Bench", config="hrbench_version_split", split="hrbench_4k")
 
 DATASETS = {"vstar": VSTAR, "hrbench_4k": HRBENCH_4K}
 
