@@ -45,8 +45,30 @@ MONET_FORMAT_SUFFIX = (
 )
 LATENT_START_ID = 151666
 
+# The paper's evaluation prompt (Appendix C): a system prompt used with VLMEvalKit
+# to reproduce the reported benchmark numbers (Monet-SFT = 82.20 on V*). This is
+# distinct from the RL *training* prompt (MONET_FORMAT_SUFFIX). Use this to match
+# the paper's accuracy; the boxed instruction goes inline in the user turn.
+PAPER_EVAL_SYSTEM = (
+    "You are an expert multimodal large language model designed to reason with "
+    "latent visual embeddings."
+)
+PAPER_EVAL_BOXED = "\nPut your final answer within \\boxed{}."
+
 
 def _build_messages(samples, prompt_style="monet"):
+    if prompt_style == "paper_eval":
+        # Reproduces the paper's VLMEvalKit setup (Appendix C).
+        return [
+            [
+                {"role": "system", "content": PAPER_EVAL_SYSTEM},
+                {"role": "user", "content": [
+                    {"type": "text", "text": s.question + PAPER_EVAL_BOXED},
+                    {"type": "image", "image": s.image},
+                ]},
+            ]
+            for s in samples
+        ]
     if prompt_style == "monet":
         # In-distribution: default system prompt, training suffix inline in the user turn.
         return [
@@ -205,9 +227,11 @@ def main():
     ap.add_argument("--dataset", required=True, choices=["vstar", "hrbench_4k"])
     ap.add_argument("--mode", required=True,
                     choices=["clean", "corrupt_gauss", "corrupt_mean"])
-    ap.add_argument("--prompt-style", default="monet", choices=["monet", "legacy"],
-                    help="monet = RL training prompt (default, in-distribution); "
-                         "legacy = old custom system prompt")
+    ap.add_argument("--prompt-style", default="monet",
+                    choices=["monet", "legacy", "paper_eval"],
+                    help="monet = RL training prompt; paper_eval = the paper's "
+                         "VLMEvalKit eval system prompt (Appendix C, reproduces "
+                         "reported accuracy); legacy = old custom system prompt")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--stats", default=None,
                     help="mu/sigma stats path (default: <out-dir>/<dataset>_stats.pt)")
