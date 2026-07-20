@@ -13,7 +13,11 @@
 #
 # Override via --export, e.g.:
 #   sbatch --export=ALL,DATASET=hrbench_4k evaluation/capimagine/palmetto/run_capimagine.sbatch
-set -euo pipefail
+#
+# NOTE: no `-u` (nounset). Sourcing /etc/bashrc + `conda activate` reference
+# unbound vars (e.g. BASHRCSOURCED), which under set -u aborts the whole job
+# before anything runs. All our own vars use ${VAR:-default}, so -u adds nothing.
+set -eo pipefail
 
 # MODEL_TAG keeps each model's clean baseline + mu/sigma stats in a SEPARATE
 # OUT_DIR. Do NOT run two models into the same OUT_DIR: the corrupt passes read
