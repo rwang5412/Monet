@@ -101,9 +101,19 @@ def run(args):
         args.model, tp=args.tp, gpu_memory_utilization=args.gpu_mem,
         max_model_len=args.max_model_len)
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
-    sampling_params = SamplingParams(
-        temperature=0.0, max_tokens=args.max_tokens, n=1,
-        skip_special_tokens=False, seed=0)
+    # Greedy (temp=0) gives the cleanest do(Z) Delta -- clean vs corrupt differences
+    # are attributable to the latent, not sampling. But greedy can deterministically
+    # starve the "sometimes" latent token (see the smoke test); when emission needs
+    # sampling, use temp>0 with a fixed seed and mirror the canonical inference top_p/k.
+    if args.temperature > 0:
+        sampling_params = SamplingParams(
+            temperature=args.temperature, top_p=0.8, top_k=50,
+            max_tokens=args.max_tokens, n=1, skip_special_tokens=False, seed=0)
+    else:
+        sampling_params = SamplingParams(
+            temperature=0.0, max_tokens=args.max_tokens, n=1,
+            skip_special_tokens=False, seed=0)
+    print(f"[harness] prompt_style={args.prompt_style} temperature={args.temperature}")
 
     inputs = vllm_mllm_process_batch_from_messages(
         _build_messages(samples, args.prompt_style), processor)
@@ -206,6 +216,9 @@ def main():
     ap.add_argument("--gpu-mem", type=float, default=0.85)
     ap.add_argument("--max-model-len", type=int, default=8192)
     ap.add_argument("--max-tokens", type=int, default=4096)
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="0 = greedy (cleanest do(Z) Delta); use 0.1 if greedy "
+                         "starves latent emission. top_p/top_k mirror inference when >0.")
     ap.add_argument("--latent-size", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()

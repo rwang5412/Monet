@@ -23,6 +23,12 @@ MODEL="${MODEL:-/scratch/$USER/monet_weights/Monet-7B}"
 MODEL_TAG="${MODEL_TAG:-model}"
 DATASET="${DATASET:-vstar}"
 OUT_DIR="${OUT_DIR:-/scratch/$USER/results/capimagine/${MODEL_TAG}/${DATASET}}"
+# V* has high-res samples that overflow 8192 (one hits ~8250, worst case ~16200),
+# and vLLM fails the whole batch on a single oversized prompt -- keep this above it.
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-18432}"
+# Greedy (temp=0) gives the cleanest do(Z) Delta. If the clean pass emits too few
+# latents, resubmit with TEMPERATURE=0.1 (near-deterministic, but lets latents fire).
+TEMPERATURE="${TEMPERATURE:-0}"
 LIMIT_FLAG=""; [ -n "${LIMIT:-}" ] && LIMIT_FLAG="--limit ${LIMIT}"
 
 mkdir -p "/scratch/$USER/logs" "$OUT_DIR"
@@ -48,7 +54,8 @@ for MODE in clean corrupt_gauss corrupt_mean; do
   echo "======== mode=$MODE ========"
   python -m evaluation.capimagine.harness \
     --model "$MODEL" --dataset "$DATASET" --mode "$MODE" \
-    --out-dir "$OUT_DIR" --tp 1 $LIMIT_FLAG
+    --out-dir "$OUT_DIR" --tp 1 \
+    --max-model-len "$MAX_MODEL_LEN" --temperature "$TEMPERATURE" $LIMIT_FLAG
 done
 
 echo "Results in $OUT_DIR"
