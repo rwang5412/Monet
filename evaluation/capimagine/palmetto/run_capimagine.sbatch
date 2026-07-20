@@ -29,6 +29,7 @@ DATASET="${DATASET:-vstar}"
 OUT_DIR="${OUT_DIR:-/scratch/$USER/results/capimagine/${MODEL_TAG}/${DATASET}}"
 # V* has high-res samples that overflow 8192 (one hits ~8250, worst case ~16200),
 # and vLLM fails the whole batch on a single oversized prompt -- keep this above it.
+PROMPT_STYLE="${PROMPT_STYLE:-monet}"   # paper_eval = the paper's VLMEvalKit prompt
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-18432}"
 # Greedy (temp=0) gives the cleanest do(Z) Delta. If the clean pass emits too few
 # latents, resubmit with TEMPERATURE=0.1 (near-deterministic, but lets latents fire).
@@ -56,9 +57,17 @@ echo "MODEL=$MODEL DATASET=$DATASET OUT_DIR=$OUT_DIR"
 
 for MODE in clean corrupt_gauss corrupt_mean; do
   echo "======== mode=$MODE ========"
+  # SHELL-export the hook config so it reaches the vLLM WORKER. The Monet runner
+  # patch loads via sitecustomize at Python startup, so vLLM snapshots the worker
+  # env BEFORE the harness sets os.environ["MONET_LATENT_*"] at runtime -- those
+  # never reach the worker (capture writes no stats, corruptions no-op -> Delta=0).
+  # LATENT_SIZE works only because it is shell-exported; do the same here.
+  if [ "$MODE" = "clean" ]; then export MONET_LATENT_MODE=capture; else export MONET_LATENT_MODE="$MODE"; fi
+  export MONET_LATENT_STATS="$OUT_DIR/${DATASET}_stats.pt"
+  export MONET_LATENT_SEED=0
   python -m evaluation.capimagine.harness \
     --model "$MODEL" --dataset "$DATASET" --mode "$MODE" \
-    --out-dir "$OUT_DIR" --tp 1 \
+    --out-dir "$OUT_DIR" --tp 1 --prompt-style "$PROMPT_STYLE" \
     --max-model-len "$MAX_MODEL_LEN" --temperature "$TEMPERATURE" $LIMIT_FLAG
 done
 
