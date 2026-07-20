@@ -45,27 +45,33 @@ MONET_FORMAT_SUFFIX = (
 )
 LATENT_START_ID = 151666
 
-# The paper's evaluation prompt, documented in the repo README (§Evaluation):
-# the authors run VLMEvalKit with this exact system message (which already carries
-# the boxed instruction, so the user turn is the bare question) and score with an
-# API judge, NOT exact match. This is the authoritative prompt for reproducing the
-# reported accuracy (Monet-SFT V* = 82.20). It is identical to SYSTEM_PROMPT above;
-# aliased here so --prompt-style paper_eval reads as "the paper's eval config".
-# (An earlier version of this constant was an invented "expert...latent visual
-# embeddings" prompt -- that was wrong and scored worse; do not reintroduce it.)
-PAPER_EVAL_SYSTEM = SYSTEM_PROMPT
+# The paper's evaluation prompt, verbatim from arXiv:2511.21395v2 Appendix C
+# ("Detailed Experimental Setup"): the authors run VLMEvalKit with this exact
+# system message, max visual tokens 8192x28x28, and score with a rule-based judge
+# (exact match) FIRST, then DeepSeek-V3.1 / Gemini-2.5-Pro as SECONDARY judges.
+# This is the authoritative config that produced Monet-SFT V* = 82.20.
+# NOTE: the repo README (§Evaluation) gives a DIFFERENT prompt ("You are a helpful
+# multimodal assistant...") -- that is SYSTEM_PROMPT above. The two sources conflict;
+# Appendix C wins because it is the exact setup behind the reported numbers. The
+# boxed instruction is not in the paper's system prompt, so we append it inline in
+# the user turn, matching how the Monet-SFT-125K training questions are formatted.
+PAPER_EVAL_SYSTEM = (
+    "You are an expert multimodal large language model designed to reason with "
+    "latent visual embeddings."
+)
+PAPER_EVAL_BOXED = "\nPut your final answer within \\boxed{}."
 
 
 def _build_messages(samples, prompt_style="monet"):
     if prompt_style == "paper_eval":
-        # Authoritative repro of the paper's VLMEvalKit eval (README §Evaluation):
-        # the README system prompt (which already carries the boxed instruction)
-        # plus the bare question. No inline suffix.
+        # Authoritative repro of the paper's VLMEvalKit eval (arXiv Appendix C):
+        # the "expert...latent visual embeddings" system prompt + the question with
+        # the boxed instruction appended inline (matching the training-data format).
         return [
             [
                 {"role": "system", "content": PAPER_EVAL_SYSTEM},
                 {"role": "user", "content": [
-                    {"type": "text", "text": s.question},
+                    {"type": "text", "text": s.question + PAPER_EVAL_BOXED},
                     {"type": "image", "image": s.image},
                 ]},
             ]
@@ -232,8 +238,9 @@ def main():
     ap.add_argument("--prompt-style", default="monet",
                     choices=["monet", "legacy", "paper_eval"],
                     help="monet = RL training prompt; paper_eval = the paper's "
-                         "VLMEvalKit eval system prompt (README Evaluation section, "
-                         "reproduces reported accuracy); legacy = same prompt (alias)")
+                         "VLMEvalKit eval system prompt (arXiv Appendix C, the config "
+                         "behind the reported 82.20); legacy = the README's prompt "
+                         "(differs from the paper; kept for comparison)")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--stats", default=None,
                     help="mu/sigma stats path (default: <out-dir>/<dataset>_stats.pt)")
