@@ -28,7 +28,17 @@ def main():
     ap.add_argument("clean_json", help="path to a <dataset>_<mode>.json from the harness")
     ap.add_argument("--show", type=int, default=6,
                     help="print this many example texts per wrong bucket")
+    ap.add_argument("--dataset", default=None,
+                    help="if given (e.g. vstar), load it and print the FULL question "
+                         "+ options for each shown example, so you can check whether "
+                         "the model's stated observation maps to the right letter "
+                         "(perception error) or the wrong one (letter-mapping bug).")
     args = ap.parse_args()
+
+    id2q = {}
+    if args.dataset:
+        from evaluation.capimagine import datasets
+        id2q = {s.id: s.question for s in datasets.load(args.dataset)}
 
     recs = json.load(open(args.clean_json))["records"]
     n = len(recs)
@@ -71,8 +81,17 @@ def main():
             continue
         print(f"\n===== examples: {k} =====")
         for r in b[:args.show]:
-            tail = r["text"][-300:].replace("\n", " ")
-            print(f"  id={r['id']} gold={r['gold']} pred={r['pred']}  ...{tail}")
+            print(f"\n  id={r['id']} gold={r['gold']} pred={r['pred']}")
+            if id2q:
+                q = id2q.get(r["id"], "<question not found>")
+                print("  QUESTION+OPTIONS:")
+                for line in q.splitlines():
+                    print(f"    {line}")
+            body = r["text"] if id2q else r["text"][-300:]
+            print("  MODEL OUTPUT:")
+            for line in body.replace("<abs_vis_token>", "«LATENT»").splitlines():
+                if line.strip():
+                    print(f"    {line}")
 
 
 if __name__ == "__main__":
