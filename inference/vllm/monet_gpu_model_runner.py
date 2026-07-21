@@ -353,7 +353,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # produces meaningless Delta=0 results); fail-safe only when unset/off.
         _requested = os.getenv("MONET_LATENT_MODE", "off").strip().lower()
         try:
-            from inference.vllm.monet_latent_hook import get_hook
+            # In our repo this imports as inference.vllm.monet_latent_hook. When this
+            # runner is COPIED into VLMEvalKit/Monet_models/ (per the README), the
+            # hook is copied alongside it, so fall back to that package -- this avoids
+            # putting the whole Monet repo on sys.path (which would shadow the
+            # installed `transformers` with the repo's local transformers/ folder).
+            try:
+                from inference.vllm.monet_latent_hook import get_hook
+            except ImportError:
+                from Monet_models.monet_latent_hook import get_hook
             self.latent_hook = get_hook()
         except Exception as e:
             if _requested not in ("", "off"):
