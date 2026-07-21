@@ -15,11 +15,39 @@ columns if they cannot. Run ``python -m evaluation.capimagine.datasets --inspect
 """
 
 import argparse
+import re
 import string
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
+
+# Some sources (lmms-lab/vstar-bench) bake the option list AND a terminal
+# "Answer with the option's letter ... directly." instruction into the question
+# text. That instruction tells the model to skip reasoning, which suppresses latent
+# emission and contradicts a "put your answer in \boxed{}" instruction. We strip it
+# and parse the inline options so the harness can rebuild a clean MCQ prompt.
+_ANSWER_HINT_RE = re.compile(r"answer with the option'?s? letter", re.IGNORECASE)
+_OPT_PAREN_RE = re.compile(r"^\s*\(([A-H])\)\s*(.+?)\s*$")      # "(A) rubber"
+_OPT_DOT_RE = re.compile(r"^\s*([A-H])[.)]\s+(.+?)\s*$")        # "A. rubber" / "A) rubber"
+
+
+def _parse_inline_mcq(text: str) -> Tuple[str, Dict[str, str]]:
+    """Split a question whose options are inline into (stem, {letter: option}).
+    Returns ("", {}) if no inline options are found (e.g. options live in columns)."""
+    stem_lines: List[str] = []
+    options: Dict[str, str] = {}
+    started = False
+    for ln in text.splitlines():
+        if _ANSWER_HINT_RE.search(ln):
+            continue  # drop the redundant/contradictory instruction
+        m = _OPT_PAREN_RE.match(ln) or _OPT_DOT_RE.match(ln)
+        if m:
+            options[m.group(1)] = m.group(2).strip()
+            started = True
+        elif not started and ln.strip():
+            stem_lines.append(ln.strip())
+    return " ".join(stem_lines).strip(), options
 
 # HF dataset coordinates
 VSTAR = dict(repo="lmms-lab/vstar-bench", config=None, split="test")
@@ -134,17 +162,39 @@ def load(name: str, limit: Optional[int] = None) -> List[Sample]:
     n = len(ds) if limit is None else min(limit, len(ds))
     for i in range(n):
         row = ds[i]
-        options_block = _render_options(row)
-        stem = str(row[qk]).strip()
+        raw_q = str(row[qk]).strip()
+        options_block = _render_options(row)  # options in separate columns?
+        if options_block is not None:
+            # Options live in dedicated columns; question text is the bare stem.
+            stem = raw_q
+            options = _block_to_options(options_block)
+        else:
+            # Options (and possibly a redundant instruction) are inline in the text.
+            stem, options = _parse_inline_mcq(raw_q)
+            if options:
+                options_block = "\n".join(f"({k}) {options[k]}" for k in sorted(options))
+            else:
+                # No parseable options: keep the text, just drop the redundant hint.
+                stem = "\n".join(l for l in raw_q.splitlines()
+                                 if not _ANSWER_HINT_RE.search(l)).strip()
         question = stem if not options_block else f"{stem}\n{options_block}"
         samples.append(Sample(
             id=f"{name}-{i:05d}",
             image=_to_pil(row[ik]),
             question=question,
             answer_letter=_answer_to_letter(row[ak], options_block),
-            meta={"category": row.get("category")},
+            meta={"category": row.get("category"), "stem": stem, "options": options},
         ))
     return samples
+
+
+def _block_to_options(block: str) -> Dict[str, str]:
+    opts: Dict[str, str] = {}
+    for ln in block.splitlines():
+        m = _OPT_PAREN_RE.match(ln) or _OPT_DOT_RE.match(ln)
+        if m:
+            opts[m.group(1)] = m.group(2).strip()
+    return opts
 
 
 def _inspect(name: str):

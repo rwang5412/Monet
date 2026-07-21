@@ -62,17 +62,58 @@ PAPER_EVAL_SYSTEM = (
 PAPER_EVAL_BOXED = "\nPut your final answer within \\boxed{}."
 
 
+# Resolution, matched to the paper (max visual tokens 8192x28x28). We set these
+# PER-IMAGE in the message dict -- the path qwen-vl-utils/process_vision_info always
+# honors, exactly like VLMEvalKit's create_image_content. This is more reliable than
+# engine-level mm_processor_kwargs, which vLLM V1 can silently drop.
+MAX_PIXELS = 8192 * 28 * 28
+MIN_PIXELS = 256 * 28 * 28
+
+
+def _image_item(sample):
+    return {"type": "image", "image": sample.image,
+            "max_pixels": MAX_PIXELS, "min_pixels": MIN_PIXELS}
+
+
+def _vlmevalkit_user_text(sample):
+    """Byte-for-byte VLMEvalKit ImageMCQDataset.build_prompt (V* has no hint):
+        Question: {stem}\\nOptions:\\nA. {a}\\nB. {b}\\n...\\nPlease select the
+        correct answer from the options above. \\n
+    No boxed here -- VLMEvalKit carries the boxed instruction in the SYSTEM prompt.
+    The trailing 'above. \\n' (space + newline) matches VLMEvalKit exactly."""
+    opts = (sample.meta or {}).get("options") or {}
+    if not opts:
+        return f"Question: {sample.question}\n"
+    stem = (sample.meta or {}).get("stem") or sample.question
+    lines = "".join(f"{k}. {opts[k]}\n" for k in sorted(opts))
+    return (f"Question: {stem}\nOptions:\n{lines}"
+            "Please select the correct answer from the options above. \n")
+
+
 def _build_messages(samples, prompt_style="monet"):
+    if prompt_style == "vlmevalkit":
+        # Mirror the paper's VLMEvalKit path byte-for-byte: image FIRST, then the
+        # clean MCQ text (no boxed), per-image resolution, and the README system
+        # prompt -- which is the one the README pairs with VLMEvalKit and which
+        # carries the "Put your final answer in \boxed{}" instruction.
+        return [
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    _image_item(s),
+                    {"type": "text", "text": _vlmevalkit_user_text(s)},
+                ]},
+            ]
+            for s in samples
+        ]
     if prompt_style == "paper_eval":
-        # Authoritative repro of the paper's VLMEvalKit eval (arXiv Appendix C):
-        # the "expert...latent visual embeddings" system prompt + the question with
-        # the boxed instruction appended inline (matching the training-data format).
+        # Appendix C system prompt + the (cleaned) question with boxed appended inline.
         return [
             [
                 {"role": "system", "content": PAPER_EVAL_SYSTEM},
                 {"role": "user", "content": [
                     {"type": "text", "text": s.question + PAPER_EVAL_BOXED},
-                    {"type": "image", "image": s.image},
+                    _image_item(s),
                 ]},
             ]
             for s in samples
@@ -83,18 +124,18 @@ def _build_messages(samples, prompt_style="monet"):
             [
                 {"role": "user", "content": [
                     {"type": "text", "text": s.question + MONET_FORMAT_SUFFIX},
-                    {"type": "image", "image": s.image},
+                    _image_item(s),
                 ]},
             ]
             for s in samples
         ]
-    # legacy: custom system role (off-distribution; kept only for comparison).
+    # legacy: the README's system prompt (kept for comparison).
     return [
         [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": [
                 {"type": "text", "text": s.question},
-                {"type": "image", "image": s.image},
+                _image_item(s),
             ]},
         ]
         for s in samples
@@ -236,11 +277,11 @@ def main():
     ap.add_argument("--mode", required=True,
                     choices=["clean", "corrupt_gauss", "corrupt_mean"])
     ap.add_argument("--prompt-style", default="monet",
-                    choices=["monet", "legacy", "paper_eval"],
-                    help="monet = RL training prompt; paper_eval = the paper's "
-                         "VLMEvalKit eval system prompt (arXiv Appendix C, the config "
-                         "behind the reported 82.20); legacy = the README's prompt "
-                         "(differs from the paper; kept for comparison)")
+                    choices=["monet", "legacy", "paper_eval", "vlmevalkit"],
+                    help="vlmevalkit = mirror the paper's VLMEvalKit path (clean MCQ "
+                         "prompt + per-image resolution + expert system prompt); "
+                         "monet = RL training prompt; paper_eval = expert system prompt "
+                         "with the raw question; legacy = the README's prompt")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--stats", default=None,
                     help="mu/sigma stats path (default: <out-dir>/<dataset>_stats.pt)")
