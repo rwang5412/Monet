@@ -34,6 +34,13 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTHONPATH="$VLME:${PYTHONPATH:-}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 export HF_HOME="${HF_HOME:-/scratch/$USER/hf}"
+export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-WARNING}"
+touch "$VLME/.env" 2>/dev/null || true
+# VLMEvalKit's can_infer MIS-scores the RL model (it trips on the latent garbage in
+# the output), so its acc.csv is NOT the do(Z) metric here. Score the prediction
+# xlsx with hand-extraction afterwards:
+#   python -m evaluation.capimagine.vlmevalkit.score_doz  (see that script)
+JUDGE="${JUDGE:-exact_matching}"
 
 cd "$VLME"
 echo "VLME=$VLME MODEL=$MODEL LATENT_SIZE=$LATENT_SIZE STATS=$STATS"
@@ -43,11 +50,11 @@ for MODE in capture corrupt_mean corrupt_gauss; do
   export MONET_LATENT_MODE="$MODE"
   export MONET_LATENT_STATS="$STATS"
   export MONET_LATENT_SEED=0
-  python run.py --data "$DATA" --model "$MODEL" --work-dir "outputs/doz_${MODE}" --verbose
+  # per-mode emission log (1/0 per sample) -- capture's log marks clean-emitting samples
+  export MONET_EMIT_LOG="/scratch/$USER/results/emit/doz_${MODE}_${MODEL}_${DATA}_emit.log"
+  mkdir -p "$(dirname "$MONET_EMIT_LOG")"; rm -f "$MONET_EMIT_LOG"
+  python run.py --data "$DATA" --model "$MODEL" --judge "$JUDGE" --work-dir "outputs/doz_${MODE}"
 done
 
-echo "=== do(Z) accuracy summary ==="
-for MODE in capture corrupt_mean corrupt_gauss; do
-  echo "--- $MODE ---"
-  cat outputs/doz_${MODE}/${MODEL}/*_acc.csv 2>/dev/null || echo "(no acc.csv)"
-done
+echo "=== done. Score with hand-extraction: ==="
+echo "  python -m evaluation.capimagine.vlmevalkit.score_doz --model $MODEL --vlme $VLME"
