@@ -16,27 +16,7 @@ def get_args():
     # ===== Basic arguments =====
     parser.add_argument("--load_model_path", type=str, default='./checkpoints/model_sft_stage1')
     parser.add_argument("--data_path", type=str, default='PathToJsonlData', nargs='+')
-    parser.add_argument("--stage", type=str, default="sft_stage1", choices=['sft_stage1', 'sft_stage2', 'sft_stage3', 'sft_stage4'])
-    # ---- Stage 4 (causal latent training). All weights 0 => byte-identical
-    # baseline (arm 0): compute_loss early-exits before any RNG. ----
-    parser.add_argument("--decode_weight", type=float, default=0.0, help="lambda_dec (writer primary)")
-    parser.add_argument("--nce_weight", type=float, default=0.0, help="lambda_nce (writer helper, ~0.1-0.3*dec)")
-    parser.add_argument("--swap_weight", type=float, default=0.0, help="lambda_swap (reader primary)")
-    parser.add_argument("--necessity_weight", type=float, default=0.0, help="lambda_nec (reader helper, ~0.1*swap)")
-    parser.add_argument("--necessity_margin", type=float, default=1.0, help="hinge margin M; calibrate from signed baseline gap, then fix")
-    parser.add_argument("--decoder_layers", type=int, default=4)
-    parser.add_argument("--decoder_dim", type=int, default=1024)
-    parser.add_argument("--decoder_lr", type=float, default=1e-4)
-    parser.add_argument("--lora_r", type=int, default=128, help="0 disables LoRA (full FT; not the default path)")
-    parser.add_argument("--lora_first_layer", type=int, default=14, help="LoRA applied to layers [first, num_layers)")
-    parser.add_argument("--cf_pairs_path", type=str, default="data/cf/pairs.jsonl")
-    parser.add_argument("--max_steps", type=int, default=-1, help="cap optimizer steps (smoke tests); -1 = full epochs")
-    parser.add_argument("--train_new_token_embeddings", action="store_true",
-                        help="REQUIRED when initializing Stage 4 from base Qwen (not a Monet "
-                             "checkpoint): the added special tokens (<abs_vis_token> etc.) have "
-                             "untrained embedding/lm_head rows, so embed_tokens and lm_head are "
-                             "made trainable via peft modules_to_save. Monet checkpoints already "
-                             "contain trained rows and should leave this off.")
+    parser.add_argument("--stage", type=str, default="sft_stage1", choices=['sft_stage1', 'sft_stage2', 'sft_stage3'])
     parser.add_argument("--task", type=str, default="mm-reasoning", choices=["mm-reasoning"])
     parser.add_argument("--save_model_path", type=str, default='./checkpoints/',help="Path to save the model checkpoints.")
     parser.add_argument("--resume_from_checkpoint", default=False, action="store_true")
