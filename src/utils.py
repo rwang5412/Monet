@@ -30,6 +30,7 @@ def get_args():
     parser.add_argument("--lora_r", type=int, default=128, help="0 disables LoRA (full FT; not the default path)")
     parser.add_argument("--lora_first_layer", type=int, default=14, help="LoRA applied to layers [first, num_layers)")
     parser.add_argument("--cf_pairs_path", type=str, default="data/cf/pairs.jsonl")
+    parser.add_argument("--max_steps", type=int, default=-1, help="cap optimizer steps (smoke tests); -1 = full epochs")
     parser.add_argument("--task", type=str, default="mm-reasoning", choices=["mm-reasoning"])
     parser.add_argument("--save_model_path", type=str, default='./checkpoints/',help="Path to save the model checkpoints.")
     parser.add_argument("--resume_from_checkpoint", default=False, action="store_true")

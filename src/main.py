@@ -412,6 +412,7 @@ gradient_checkpointing = True
 
 training_args = SFTConfig(
     output_dir=save_dir,
+    max_steps=getattr(args, 'max_steps', -1),
     num_train_epochs=args.epochs,
     per_device_train_batch_size=args.bsz,
     gradient_accumulation_steps=args.grad_accum_steps,

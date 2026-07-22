@@ -33,6 +33,13 @@ class CFStore:
 
     def __init__(self, pairs_path: str):
         self.by_id: Dict[str, dict] = {}
+        if not os.path.exists(pairs_path):
+            # No counterfactual data yet: every row runs Pool-B style (F1 only).
+            # Legal for arms 0/1 (baseline + writer-only); arm 2 without pairs
+            # would silently train no reader loss, so warn loudly.
+            print(f"[CFStore] WARNING: {pairs_path} not found -> 0 twins loaded; "
+                  f"all rows run clean-forward only (arms 0/1). Do NOT run arm 2 like this.")
+            return
         with open(pairs_path) as f:
             for line in f:
                 if line.strip():
