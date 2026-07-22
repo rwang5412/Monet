@@ -31,6 +31,12 @@ def get_args():
     parser.add_argument("--lora_first_layer", type=int, default=14, help="LoRA applied to layers [first, num_layers)")
     parser.add_argument("--cf_pairs_path", type=str, default="data/cf/pairs.jsonl")
     parser.add_argument("--max_steps", type=int, default=-1, help="cap optimizer steps (smoke tests); -1 = full epochs")
+    parser.add_argument("--train_new_token_embeddings", action="store_true",
+                        help="REQUIRED when initializing Stage 4 from base Qwen (not a Monet "
+                             "checkpoint): the added special tokens (<abs_vis_token> etc.) have "
+                             "untrained embedding/lm_head rows, so embed_tokens and lm_head are "
+                             "made trainable via peft modules_to_save. Monet checkpoints already "
+                             "contain trained rows and should leave this off.")
     parser.add_argument("--task", type=str, default="mm-reasoning", choices=["mm-reasoning"])
     parser.add_argument("--save_model_path", type=str, default='./checkpoints/',help="Path to save the model checkpoints.")
     parser.add_argument("--resume_from_checkpoint", default=False, action="store_true")

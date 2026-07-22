@@ -21,7 +21,11 @@
 set -eo pipefail
 
 ARM="${ARM:-arm0}"
-BASE="${BASE:-/scratch/$USER/monet_weights/Monet-SFT-7B/stage3}"
+# From-scratch default: BASE Qwen2.5-VL (pre-download to scratch; compute nodes are
+# air-gapped). NEW_TOK=1 is REQUIRED with a base-Qwen BASE (trains the added special
+# tokens' embedding/lm_head rows); leave 0 for Monet checkpoints.
+BASE="${BASE:-/scratch/$USER/monet_weights/Qwen2.5-VL-7B-Instruct}"
+NEW_TOK="${NEW_TOK:-1}"
 DATA_ROOT="${DATA_ROOT:-/scratch/$USER/monet_data/Monet-SFT-125K}"
 CF_PAIRS="${CF_PAIRS:-/scratch/$USER/monet_data/cf/pairs.jsonl}"
 LATENT_SIZE="${LATENT_SIZE:-8}"     # SFT-trained K
@@ -56,6 +60,7 @@ torchrun --nproc-per-node="${NPROC:-2}" --master-port=29517 -m src.main \
   --swap_weight "$WS" --necessity_weight "$WNEC" \
   --necessity_margin "${MARGIN:-1.0}" \
   --max_steps "${STEPS:--1}" \
+  $([ "$NEW_TOK" = "1" ] && echo --train_new_token_embeddings) \
   --lora_r "${LORA_R:-128}" \
   --cf_pairs_path "$CF_PAIRS" \
   --wandb_name "stage4_${ARM}"

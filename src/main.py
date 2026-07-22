@@ -374,9 +374,17 @@ elif args.stage == 'sft_stage4':
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                             "gate_proj", "up_proj", "down_proj"],
             layers_to_transform=list(range(args.lora_first_layer, config.num_hidden_layers)),
+            # Base-Qwen init: the added latent/observation tokens have UNTRAINED
+            # embedding + lm_head rows (main.py adds them to the tokenizer only;
+            # they land in the padded region of the embedding matrix). Freezing
+            # embeddings would make the latent markers unlearnable noise forever.
+            modules_to_save=(["embed_tokens", "lm_head"]
+                             if args.train_new_token_embeddings else None),
         )
         model = get_peft_model(model, lora_cfg)
         model.print_trainable_parameters()
+    elif args.train_new_token_embeddings:
+        pass  # full FT: everything already trainable
 
     aux_decoder = None
     if args.decode_weight > 0:
