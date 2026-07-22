@@ -41,15 +41,25 @@ touch "$VLME/.env" 2>/dev/null || true
 # xlsx with hand-extraction afterwards:
 #   python -m evaluation.capimagine.vlmevalkit.score_doz  (see that script)
 JUDGE="${JUDGE:-exact_matching}"
+# MODES lets you run a subset, e.g. MODES=capture for a latent-collapse probe.
+MODES="${MODES:-capture corrupt_mean corrupt_gauss}"
+# DUMP=1 -> capture also saves every individual latent vector for probe_collapse.py.
+DUMP_PT="/scratch/$USER/results/vlmeval_doz/${MODEL}_${DATA}_latents.pt"
 
 cd "$VLME"
-echo "VLME=$VLME MODEL=$MODEL LATENT_SIZE=$LATENT_SIZE STATS=$STATS"
+echo "VLME=$VLME MODEL=$MODEL LATENT_SIZE=$LATENT_SIZE STATS=$STATS MODES='$MODES'"
 
-for MODE in capture corrupt_mean corrupt_gauss; do
+for MODE in $MODES; do
   echo "======== do(Z) mode=$MODE ========"
   export MONET_LATENT_MODE="$MODE"
   export MONET_LATENT_STATS="$STATS"
   export MONET_LATENT_SEED=0
+  if [ "$MODE" = "capture" ] && [ -n "${DUMP:-}" ]; then
+    export MONET_LATENT_DUMP="$DUMP_PT"; mkdir -p "$(dirname "$DUMP_PT")"; rm -f "$DUMP_PT"
+    echo "  dumping individual latents -> $DUMP_PT"
+  else
+    unset MONET_LATENT_DUMP
+  fi
   # per-mode emission log (1/0 per sample) -- capture's log marks clean-emitting samples
   export MONET_EMIT_LOG="/scratch/$USER/results/emit/doz_${MODE}_${MODEL}_${DATA}_emit.log"
   mkdir -p "$(dirname "$MONET_EMIT_LOG")"; rm -f "$MONET_EMIT_LOG"
