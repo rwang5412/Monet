@@ -349,6 +349,60 @@ elif args.stage == 'sft_stage2':
 elif args.stage == 'sft_stage3':
     CustomTrainer = CustomTrainerSFT_STAGE3
     collate_fn = partial(collate_fn_sft_stage3)
+elif args.stage == 'sft_stage4':
+    # Stage 4: causal latent training (see src/train/trainer_stage4.py).
+    from src.train.trainer_stage4 import CustomTrainerSFT_STAGE4
+    from src.train.decode_loss import LatentObsDecoder
+    from src.data.cf_collator import CFCollator, CFStore
+    import re as _re
+
+    # annotate each processed row with its boxed answer text (CFCollator asserts on it)
+    for _s in train_dataset:
+        _texts = " ".join(
+            it.get("text", "") for m in _s["data"] if m.get("role") == "assistant"
+            for it in m["content"] if it.get("type") == "text")
+        _m = _re.findall(r"\\boxed\{([^{}]*)\}", _texts)
+        _s["answer_text"] = _m[-1] if _m else None
+    train_dataset = [s for s in train_dataset if s.get("answer_text")]
+
+    # LoRA on the backbone (writer AND reader are the same LM; the Stage-2/3
+    # "frozen generator" gradient mask is deliberately dropped).
+    if args.lora_r > 0:
+        from peft import LoraConfig, get_peft_model
+        lora_cfg = LoraConfig(
+            r=args.lora_r, lora_alpha=2 * args.lora_r, lora_dropout=0.0,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+            layers_to_transform=list(range(args.lora_first_layer, config.num_hidden_layers)),
+        )
+        model = get_peft_model(model, lora_cfg)
+        model.print_trainable_parameters()
+
+    aux_decoder = None
+    if args.decode_weight > 0:
+        aux_decoder = LatentObsDecoder(
+            vocab_size=len(processor.tokenizer), d_latent=config.hidden_size,
+            d_dec=args.decoder_dim, n_layers=args.decoder_layers,
+            pad_id=processor.tokenizer.pad_token_id or 0)
+        aux_decoder.init_token_emb_from_backbone(
+            model.get_input_embeddings().weight.detach())
+        # Attach to the model so the optimizer/DeepSpeed sees its params; new
+        # modules train fully (separate LR handled in the trainer).
+        (model.base_model.model if hasattr(model, "base_model") else model
+         ).aux_latent_decoder = aux_decoder
+        for p in aux_decoder.parameters():
+            p.requires_grad_(True)
+
+    cf_store = CFStore(args.cf_pairs_path)
+    collate_fn = CFCollator(
+        base_collate=partial(collate_fn_sft_stage3),
+        tokenizer=processor.tokenizer, cf_store=cf_store)
+    CustomTrainer = CustomTrainerSFT_STAGE4
+    stage4_trainer_kwargs = {
+        "aux_decoder": aux_decoder,
+        "latent_pad_id": int(latent_pad_idx.item() if hasattr(latent_pad_idx, 'item')
+                             else latent_pad_idx),
+    }
 
 if args.deepspeed != "":
     print(f"Note: DeepSpeed is enabled. Using the deepspeed config in {args.deepspeed} (the bsz per device and gradient_accumulation_steps will be adopted from the deepspeed config)")
@@ -406,6 +460,12 @@ elif args.stage in ['sft_stage2','sft_stage3']:
     setattr(training_args, 'teacher_latent_dir', args.teacher_latent_dir)
     setattr(training_args, 'image_resize', args.image_resize)
     setattr(training_args, 'sft_stage2_align_poss', args.sft_stage2_align_poss)
+elif args.stage == 'sft_stage4':
+    setattr(training_args, 'gradient_checkpointing_kwargs', {"use_reentrant": False})
+    setattr(training_args, 'latent_size', args.latent_size)
+    for k in ('decode_weight', 'nce_weight', 'swap_weight', 'necessity_weight',
+              'necessity_margin', 'decoder_lr'):
+        setattr(training_args, k, getattr(args, k))
 
 # Initialize the trainer (callbacks that need trainer instance will be added after)
 trainer = CustomTrainer(
@@ -414,7 +474,8 @@ trainer = CustomTrainer(
     train_dataset=train_dataset,
     data_collator=collate_fn,
     processing_class=processor,
-    exp_name=args.save_model_path.split('/')[-1]
+    exp_name=args.save_model_path.split('/')[-1],
+    **(stage4_trainer_kwargs if args.stage == 'sft_stage4' else {}),
 )
 
 
