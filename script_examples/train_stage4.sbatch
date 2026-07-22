@@ -55,6 +55,7 @@ torchrun --nproc-per-node="${NPROC:-2}" --master-port=29517 -m src.main \
   --decode_weight "$WD" --nce_weight "$WN" \
   --swap_weight "$WS" --necessity_weight "$WNEC" \
   --necessity_margin "${MARGIN:-1.0}" \
+  --max_steps "${STEPS:--1}" \
   --lora_r "${LORA_R:-128}" \
   --cf_pairs_path "$CF_PAIRS" \
   --wandb_name "stage4_${ARM}"
