@@ -54,15 +54,17 @@ def main():
         raise SystemExit("no JUDGED capture (clean) result -- run the judge step first.")
 
     order = list(_judged(a.vlme, "capture", a.model, a.data)["index"])
+    total = len(order)
     emitlog = (f"/scratch/{os.environ.get('USER','')}/results/emit/"
                f"doz_capture_{a.model}_{a.data}_emit.log")
     flags = [l.strip() for l in open(emitlog)] if os.path.exists(emitlog) else []
-    if len(flags) == len(order):
+    if len(flags) == total:
         emit = {i for i, f in zip(order, flags) if f == "1"}
-        emit_note = f"{len(emit)} of {len(order)}"
+        emit_line = (f"latents emitted: {len(emit)}/{total} samples "
+                     f"({100*len(emit)/max(total,1):.1f}%)")
     else:
         emit = set(order)
-        emit_note = f"{len(emit)} (ALL -- emit log missing)"
+        emit_line = f"latents emitted: UNKNOWN (emit log missing) -- do(Z) over ALL {total}"
 
     clean_acc = sum(hit["capture"][i] for i in emit) / max(len(emit), 1)
 
@@ -70,7 +72,9 @@ def main():
     print("=" * W)
     print(f"  CapImagine do(Z)  |  {a.model}  |  {a.data}")
     print("=" * W)
-    print(f"  clean-emitting samples: N = {emit_note}")
+    print(f"  {emit_line}")
+    print(f"  do(Z) measured over the {len(emit)} emitting samples "
+          f"(corruption only affects those)")
     print()
     print(f"  {'pass':<16}{'accuracy':>10}{'Δ vs clean':>13}{'text-changed':>15}")
     print("  " + "-" * (W - 4))
