@@ -2,9 +2,9 @@
 #SBATCH --job-name=sft2_mod
 #SBATCH --output=/scratch/%u/logs/sft2_mod_%j.out
 #SBATCH --error=/scratch/%u/logs/sft2_mod_%j.err
-#SBATCH --gpus-per-node=a100:2
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=160G
+#SBATCH --gpus-per-node=a100:8
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=320G
 #SBATCH --time=72:00:00
 #
 # Modified SFT Stage 2 on the ORIGINAL Monet stage-1 warm-up checkpoint.
@@ -63,7 +63,7 @@ for d in "$REPS_POS" "$REPS_NEG"; do
   if [ "$n" -eq 0 ]; then echo "FATAL: teacher rep cache empty/missing: $d"; exit 1; fi
 done
 
-torchrun --nproc-per-node="${NPROC:-2}" --master-port="${PORT:-29511}" -m src.main \
+torchrun --nproc-per-node="${NPROC:-8}" --master-port="${PORT:-29511}" -m src.main \
   --epochs "$EPOCHS" \
   --bsz 1 \
   --grad_accum_steps 16 \
