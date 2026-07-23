@@ -338,6 +338,12 @@ for i, sample in tqdm(enumerate(all_train_dataset[:]), desc="Collecting training
     if processed is not None:
         train_dataset.append(processed)
 
+# Holdout support: cap the training set so the dataset TAIL stays unseen
+# (gate_stage2 evaluates on the last rows of the data file).
+if getattr(args, 'num_samples', -1) and args.num_samples > 0:
+    train_dataset = train_dataset[:args.num_samples]
+    logging.info(f"--num_samples: training on first {len(train_dataset)} processed rows; tail held out")
+
 #train_dataset = [d for d in [preprocess_function(sample) for sample in all_train_dataset[:]] if d is not None]
 
 

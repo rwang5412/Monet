@@ -45,6 +45,9 @@ GROUNDING_QUEUE="${GROUNDING_QUEUE:-4096}"
 # From the layer_sel probe (upper third by separation); caches must be built with
 # the same list via --keep_layers.
 ALIGN_IDX="${ALIGN_IDX:-20,21,22,23,24,25,26,27,28}"
+# Holdout: train on the first N processed rows so the file's tail (~500 raw rows,
+# covering gate_stage2's last-300 eval slice) is never seen in training.
+NUM_SAMPLES="${NUM_SAMPLES:-118000}"
 
 SAVE_CKPT="${SAVE_CKPT:-sft_stage2_residual${MARGIN}_ground${GROUNDING_WEIGHT}_latent${LATENT_SIZE}}"
 SAVE="/scratch/$USER/monet_ckpts/${SAVE_CKPT}"
@@ -79,6 +82,7 @@ torchrun --nproc-per-node="${NPROC:-2}" --master-port="${PORT:-29511}" -m src.ma
   --teacher_reps_dir "$REPS_POS" \
   --teacher_reps_neg_dir "$REPS_NEG" \
   --alignment_layer_indices "$ALIGN_IDX" \
+  --num_samples "$NUM_SAMPLES" \
   --obs_residual_margin "$MARGIN" \
   --grounding_weight "$GROUNDING_WEIGHT" \
   --grounding_queue_size "$GROUNDING_QUEUE" \
