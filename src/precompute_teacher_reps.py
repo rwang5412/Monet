@@ -348,6 +348,9 @@ def probe_fig4(device, n: int):
                 accs_pos.append(a_pos)
                 accs_neg.append(a_neg)
     n_ok = len(accs_pos)
+    assert n_ok > 0, ("fig4 probe: no usable samples -- almost certainly the image "
+                      "paths (e.g. flat-extracted zip vs 'Visual_CoT/images/...' "
+                      "references). Fix the layout and rerun.")
     mp = sum(accs_pos) / max(n_ok, 1)
     mn = sum(accs_neg) / max(n_ok, 1)
     print("=" * 60)
