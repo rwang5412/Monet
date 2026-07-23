@@ -45,6 +45,20 @@ def get_args():
     parser.add_argument("--alignment_layer", choices=["all_layers", "last_layer"])
     parser.add_argument("--emphasize_latent_weight", default=1.0, type=float, help="Weight of the loss that only flow through latents in SFT Stage 2.")
     parser.add_argument("--sft_stage2_align_poss", default='obs', choices=['obs', 'latent_end'])
+    # ---- Stage-2 modifications (defaults preserve original behavior exactly) ----
+    parser.add_argument("--teacher_reps_neg_dir", type=str, default=None,
+                        help="Directory of NO-aux-image teacher obs reps (h_neg). When set, the "
+                             "Stage-2 alignment becomes the residual margin objective "
+                             "(closer to h_pos than to h_neg by obs_residual_margin). Generate "
+                             "with precompute_teacher_reps.py --no_aux_images.")
+    parser.add_argument("--obs_residual_margin", type=float, default=0.2)
+    parser.add_argument("--grounding_weight", type=float, default=0.0,
+                        help="lambda for the latent-grounding InfoNCE (Stage-2 Change 2); 0 disables.")
+    parser.add_argument("--grounding_queue_size", type=int, default=4096)
+    parser.add_argument("--grounding_temp", type=float, default=0.07)
+    parser.add_argument("--no_aux_images", action='store_true', default=False,
+                        help="precompute_teacher_reps.py only: run the teacher WITHOUT auxiliary "
+                             "images (produces the h_neg cache for the residual objective).")
     parser.add_argument("--sft_stage2_global_img_tokens", type=int, help="Maximum img pixels in a sequence will be sft_stage2_global_max_img_tokens*28*28", default=1500)
     parser.add_argument("--sft_stage2_per_img_tokens", type=int, help="Maximum pixels per img will be sft_stage2_global_max_img_tokens*28*28", default=1280)
     parser.add_argument("--sft_stage3_img_tokens", type=int, help="Maximum img pixels in a sequence will be sft_stage3_max_img_tokens*28*28", default=2000)

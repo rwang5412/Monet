@@ -147,6 +147,12 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
         self.observation_token_acc_step = 0
         self.alignment_loss_cum = 0.
         self.alignment_loss_steps = 0
+        # Stage-2 changes: residual objective (needs the no-aux teacher cache) and
+        # the latent grounding InfoNCE (module attached to the model in main.py).
+        self.teacher_reps_neg_dir = getattr(self.args, 'teacher_reps_neg_dir', None)
+        self.grounding_weight = float(getattr(self.args, 'grounding_weight', 0.0))
+        self.grounding_loss_cum = 0.
+        self.grounding_loss_steps = 0
 
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -182,24 +188,64 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
 
         if self.args.alignment_weight != 0:
             # Load precomputed teacher representations of observation tokens for alignment loss
-            teacher_reps = load_offline_tensor(self.args.teacher_reps_dir, batch_metadata=inputs['metadata'], 
+            teacher_reps = load_offline_tensor(self.args.teacher_reps_dir, batch_metadata=inputs['metadata'],
             alignment_layer=self.args.alignment_layer)
             inputs['alignment_poss'] = inputs['observation_poss']
 
             inputs['teacher_hidden_states_for_alignment'] = teacher_reps
 
+            # Change 1 (residual objective): also load the NO-aux-image teacher
+            # cache; the modeling alignment block then computes the margin form
+            # (closer to with-image teacher than to without-image teacher) instead
+            # of the absolute cosine. Same filename pattern, separate directory.
+            if self.teacher_reps_neg_dir:
+                teacher_reps_neg = load_offline_tensor(self.teacher_reps_neg_dir, batch_metadata=inputs['metadata'],
+                alignment_layer=self.args.alignment_layer)
+                inputs['teacher_hidden_states_for_alignment_neg'] = teacher_reps_neg
+                inputs['obs_residual_margin'] = float(getattr(self.args, 'obs_residual_margin', 0.2))
+
         teacher_ce_loss, teacher_output = super().compute_loss(
-                model, 
+                model,
                 inputs,
                 return_outputs=True, num_items_in_batch=num_items_in_batch
             )
-        
+
         alignment_loss = teacher_output.loss_dict.get('alignment', torch.tensor(0.0))
-        if self.args.emphasize_latent_weight != 0.0 and alignment_loss.item() != 0.0: # latent-only backpropagation for alignment loss
-            latent_only_loss = compute_latents_only_loss(outputs.ce_patch_vec, self.args.alignment_weight * alignment_loss)
+
+        # Change 2 (latent grounding InfoNCE). Two calls: the writer-routed one
+        # feeds the latent-only surrogate (gradient reaches model params ONLY
+        # through the generated latents); the detached one trains the projector,
+        # which the surrogate cannot update (it re-injects gradients at the
+        # latents, upstream of the projector's own parameters).
+        grounding_writer = None
+        if self.grounding_weight != 0.0:
+            m = model
+            while hasattr(m, 'module'):
+                m = m.module
+            grounding_mod = getattr(m, 'latent_grounding', None)
+            assert grounding_mod is not None, \
+                "grounding_weight != 0 but model has no latent_grounding module (attach it in main.py)"
+            aux_feats = getattr(outputs, 'aux_image_feats', None) or [None] * len(outputs.ce_patch_vec)
+            grounding_writer = grounding_mod(outputs.ce_patch_vec, aux_feats, enqueue=True)
+            grounding_proj = grounding_mod([z.detach() for z in outputs.ce_patch_vec],
+                                           aux_feats, enqueue=False)
+            self.grounding_loss_cum += float(grounding_writer.detach().item())
+            self.grounding_loss_steps += 1
+
+        # Latent-routed auxiliary total (alignment/residual + grounding), then the
+        # latent-only backprop surrogate: stop_grad(dL/d_latent)^T . latent.
+        latent_routed = self.args.alignment_weight * alignment_loss
+        if grounding_writer is not None:
+            latent_routed = latent_routed + self.grounding_weight * grounding_writer
+        has_latent_routed = (isinstance(latent_routed, torch.Tensor) and latent_routed.requires_grad
+                             and float(latent_routed.detach()) != 0.0)
+        if self.args.emphasize_latent_weight != 0.0 and has_latent_routed: # latent-only backpropagation
+            latent_only_loss = compute_latents_only_loss(outputs.ce_patch_vec, latent_routed)
             loss = self.args.emphasize_latent_weight * latent_only_loss + teacher_ce_loss
         else:
-            loss = teacher_ce_loss + self.args.alignment_weight * alignment_loss
+            loss = teacher_ce_loss + latent_routed
+        if grounding_writer is not None:
+            loss = loss + self.grounding_weight * grounding_proj  # projector-only path (latents detached)
 
         if getattr(teacher_output, 'mean_emphasize_acc', None) is not None:
             self.observation_token_acc += getattr(teacher_output, 'mean_emphasize_acc')
@@ -238,6 +284,10 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
             merged[f'alignment_loss'] = round(self.alignment_loss_cum / max(1, self.alignment_loss_steps), 6)
             self.alignment_loss_cum = 0.0
             self.alignment_loss_steps = 0
+        if self.grounding_loss_steps > 0:
+            merged["grounding_loss"] = round(self.grounding_loss_cum / max(1, self.grounding_loss_steps), 6)
+            self.grounding_loss_cum = 0.
+            self.grounding_loss_steps = 0
         if self.observation_token_acc_step > 0:
             merged["observation_token_acc"] = round(self.observation_token_acc/ max(1, self.observation_token_acc_step), 6)
             self.observation_token_acc = 0.

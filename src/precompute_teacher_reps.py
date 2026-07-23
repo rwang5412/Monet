@@ -116,11 +116,29 @@ def collate_fn_precompute_teacher_rep(examples, alignment="boxed_start"):
     batch = {}
     batch['metadata'] = [ex['metadata'] for ex in examples]
     examples = [ex['data'] for ex in examples]
-    texts = [processor.apply_chat_template(ex, tokenize=False) for ex in examples]
 
-    # replace <abs_vis_token></abs_vis_token> with <|vision_start|><|image_pad|><|vision_end|> for each <|im_start|>assistant content
-    texts = [replace_latent_placeholder_with_img_pad(text) for text in texts]
-    
+    if getattr(args, 'no_aux_images', False):
+        # h_neg mode (Stage-2 residual objective): the teacher sees the SAME text
+        # CoT but NO auxiliary images and no latent placeholders -- pure text +
+        # question image. The observation-token COUNT is unchanged (only image
+        # pads / placeholders are removed), so the saved reps align 1:1 with the
+        # with-aux h_pos cache. The question (user) part gets the same
+        # process_multiple_question_img treatment as the with-aux path so the two
+        # caches differ ONLY by the auxiliary image.
+        examples = remove_auxiliary_images(examples)
+        texts = []
+        for ex in examples:
+            t = processor.apply_chat_template(ex, tokenize=False)
+            parts = t.split("<|im_start|>assistant")
+            out = process_multiple_question_img(parts[0])
+            for p in parts[1:]:
+                out += "<|im_start|>assistant" + p.replace("<abs_vis_token></abs_vis_token>", "")
+            texts.append(out)
+    else:
+        texts = [processor.apply_chat_template(ex, tokenize=False) for ex in examples]
+        # replace <abs_vis_token></abs_vis_token> with <|vision_start|><|image_pad|><|vision_end|> for each <|im_start|>assistant content
+        texts = [replace_latent_placeholder_with_img_pad(text) for text in texts]
+
     ################################################
     # teacher
     ################################################

@@ -249,6 +249,31 @@ def alignment_loss(teacher_hidden_states: torch.Tensor, student_hidden_states: U
         total_loss = 1 - torch.nn.functional.cosine_similarity(student_hidden_states, teacher_hidden_states, 0)
     return total_loss
 
+
+def obs_residual_loss(teacher_pos: torch.Tensor, teacher_neg: torch.Tensor,
+                      student_hidden_states: torch.Tensor, margin: float = 0.2):
+    """Residual (margin) form of the observation alignment (Stage-2 Change 1).
+
+    The absolute objective 1 - cos(h*_obs, h_obs) starts near its optimum:
+    observation states are dominated by token identity + text context, so two
+    states differing only in visual content sit at ~0.95 cosine and the loss has
+    almost no gradient to give the latents. Here the student's obs state must be
+    closer to the WITH-aux-image teacher (pos) than to the WITHOUT-aux-image
+    teacher (neg) by `margin`; everything the two teachers share cancels, leaving
+    exactly the visual residual -- the content the latents are supposed to carry.
+
+    Shapes: all [num_layer, num_align_in_a_seg, dim] (all-layer alignment) or
+    [dim] (last-layer). Teachers are precomputed and detached.
+    """
+    if teacher_pos.dim() == 3:
+        dev = student_hidden_states.device
+        s_pos = torch.nn.functional.cosine_similarity(teacher_pos.to(dev), student_hidden_states, dim=-1)
+        s_neg = torch.nn.functional.cosine_similarity(teacher_neg.to(dev), student_hidden_states, dim=-1)
+        return torch.nn.functional.relu(margin - s_pos + s_neg).mean()
+    s_pos = torch.nn.functional.cosine_similarity(student_hidden_states, teacher_pos, 0)
+    s_neg = torch.nn.functional.cosine_similarity(student_hidden_states, teacher_neg, 0)
+    return torch.nn.functional.relu(margin - s_pos + s_neg)
+
 @torch.no_grad()
 def _svd_select_U(
     X: torch.Tensor,
@@ -750,6 +775,9 @@ class Qwen2_5_VLModelOutputWithPast(ModelOutput):
     ce_patch_pos: Optional[List[List[int]]] = None
     ce_patch_vec: Optional[List[torch.Tensor]] = None
     alignment_loss: Optional[torch.FloatTensor] = None
+    # Post-merger visual tokens of the ASSISTANT-turn (auxiliary) images, per
+    # sample; populated in latent_mode for the Stage-2 grounding loss.
+    aux_image_feats: Optional[List[torch.Tensor]] = None
 
 class Qwen2_5_VLRotaryEmbedding(nn.Module):
     def __init__(self, config: Qwen2_5_VLTextConfig, device=None):
@@ -1575,7 +1603,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         latent_mode: Optional[bool] = False,
         alignment_poss: Optional[List[List]] = None,
         teacher_hidden_states_for_alignment: Optional[Union[List[List[torch.Tensor]], torch.Tensor]] = None, # for the latent forward
-        ce_patch_pos: Optional[List[List[int]]] = None, 
+        teacher_hidden_states_for_alignment_neg: Optional[List[torch.Tensor]] = None, # no-aux-image teacher (Stage-2 residual objective)
+        obs_residual_margin: Optional[float] = 0.2,
+        ce_patch_pos: Optional[List[List[int]]] = None,
         ce_patch_vec: Optional[List[torch.Tensor]] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen2_5_VLModelOutputWithPast]:
@@ -1689,6 +1719,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         if latent_mode: # latent forward, SFT Stage 2 student CoT or SFT Stage 3
             ce_patch_pos = [[] for _ in range(batch_size)]   # List[List[int]]
             ce_patch_vec = [[] for _ in range(batch_size)]   # List[List[Tensor(H,)]]
+            aux_image_feats_out = [None] * batch_size        # per-sample aux-image tokens
             hidden_states_to_return = [[] for _ in range(batch_size)]
             total_align_loss = None
             
@@ -1751,7 +1782,19 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
                 # find the start of responses
                 ans_start = _first_pattern_end(input_ids[b], self.config.answer_start_pattern)
-                          
+
+                # Collect the post-merger visual tokens of the ASSISTANT-turn
+                # (auxiliary) images for this sample: image-pad positions after
+                # the first assistant marker. inputs_embeds already contains the
+                # scattered image embeds, so this is a cheap index. Detached --
+                # these are targets for the Stage-2 grounding loss, not a
+                # gradient path (the vision encoder is frozen anyway).
+                aux_pos_b = ((input_ids[b] == self.config.image_token_id).nonzero(as_tuple=False)
+                             .flatten())
+                aux_pos_b = aux_pos_b[aux_pos_b >= ans_start]
+                aux_image_feats_out[b] = (inputs_embeds[b, aux_pos_b, :].detach()
+                                          if aux_pos_b.numel() > 0 else None)
+
                 # `teacher_hidden_states_for_alignment` corresponds to the teacher hidden states of the observation tokens in SFT Stage 2, or the target hidden states of the latent tokens in SFT Stage 3
                 if teacher_hidden_states_for_alignment is not None: 
                     assert teacher_hidden_states_for_alignment[b].shape[1] == len(align_pos), f"teacher_hidden_states_for_alignment.shape[1] ({teacher_hidden_states_for_alignment[b].shape[1]}) != len(align_pos) ({len(align_pos)})"
@@ -1998,6 +2041,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 rope_deltas=self.rope_deltas,
                 ce_patch_pos=ce_patch_pos,                 # List[List[int]]
                 ce_patch_vec=ce_patch_vec_tensors,         # List[Tensor(num_latents_b, H)]
+                aux_image_feats=aux_image_feats_out,       # List[Tensor(M_b, H) | None]
             )
             return output if return_dict else output.to_tuple()
         # ---------- END latent_mode implementation ----------
@@ -2049,11 +2093,22 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 total_align_loss = 0.
                 all_student_hidden_states = torch.stack(outputs.hidden_states, dim=0) # [num_layer, batch_size, seq_len, dim]
                 for b in range(batch_size):
-                    student_hidden_states = all_student_hidden_states[:, b, alignment_poss[b], :] 
-                    total_align_loss += alignment_loss(
-                                            teacher_hidden_states_for_alignment[b], # [num_layer, num_align_in_a_seg, dim]
-                                            student_hidden_states, # [num_layer, num_align_in_a_seg, dim]
-                                        )
+                    student_hidden_states = all_student_hidden_states[:, b, alignment_poss[b], :]
+                    if teacher_hidden_states_for_alignment_neg is not None:
+                        # Stage-2 residual objective: student obs states must be
+                        # closer to the with-aux-image teacher than to the
+                        # no-aux-image teacher by a margin (see obs_residual_loss).
+                        total_align_loss += obs_residual_loss(
+                                                teacher_hidden_states_for_alignment[b],
+                                                teacher_hidden_states_for_alignment_neg[b],
+                                                student_hidden_states,
+                                                margin=obs_residual_margin,
+                                            )
+                    else:
+                        total_align_loss += alignment_loss(
+                                                teacher_hidden_states_for_alignment[b], # [num_layer, num_align_in_a_seg, dim]
+                                                student_hidden_states, # [num_layer, num_align_in_a_seg, dim]
+                                            )
                 total_align_loss /= batch_size
                 output_hidden_states = False
 
@@ -2104,6 +2159,7 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     latent_embeds: Optional[List[torch.Tensor]] = None
     mean_emphasize_acc: Optional[float] = None
     loss_dict: Optional[dict] = None # Optional dictionary of losses when multiple objectives are computed in a single forward
+    aux_image_feats: Optional[List[torch.Tensor]] = None # per-sample aux-image tokens (latent_mode)
 
 
 class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
@@ -2173,7 +2229,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         alignment_poss: Optional[List[List]] = None,
         latent_mode: Optional[bool] = False,
         teacher_hidden_states_for_alignment: Optional[List[List[torch.Tensor]]] = None, # corresponding to the teacher hidden states of the observation tokens in SFT Stage 2, or the target hidden states of the latent tokens in SFT Stage 3
-        ce_patch_pos: Optional[List[List[int]]] = None, 
+        teacher_hidden_states_for_alignment_neg: Optional[List[torch.Tensor]] = None, # no-aux-image teacher (Stage-2 residual objective)
+        obs_residual_margin: Optional[float] = 0.2,
+        ce_patch_pos: Optional[List[List[int]]] = None,
         ce_patch_vec: Optional[List[torch.Tensor]] = None,
         ce_emphasize_factor: Optional[float] = 1.0,
         ce_emphasize_poss: Optional[List[List[int]]] = None,
@@ -2257,6 +2315,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             latent_mode=latent_mode,
             alignment_poss=alignment_poss,
             teacher_hidden_states_for_alignment=teacher_hidden_states_for_alignment,
+            teacher_hidden_states_for_alignment_neg=teacher_hidden_states_for_alignment_neg,
+            obs_residual_margin=obs_residual_margin,
             ce_patch_pos=ce_patch_pos,
             ce_patch_vec=ce_patch_vec,
             **kwargs,
@@ -2363,7 +2423,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 ce_patch_vec=outputs.ce_patch_vec if hasattr(outputs, "ce_patch_vec") else None,
                 latent_embeds=latent_embeds,
                 mean_emphasize_acc=mean_emphasize_acc,
-                loss_dict=loss_dict if len(loss_dict)>0 else None
+                loss_dict=loss_dict if len(loss_dict)>0 else None,
+                aux_image_feats=getattr(outputs, "aux_image_feats", None),
             )
 
     def prepare_inputs_for_generation(
