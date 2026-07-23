@@ -36,9 +36,15 @@ ALIGNMENT_WEIGHT="${ALIGNMENT_WEIGHT:-2.0}"
 EMPHASIZE_LATENT_WEIGHT="${EMPHASIZE_LATENT_WEIGHT:-2.0}"
 EPOCHS="${EPOCHS:-2}"
 # Modification hyperparameters.
-MARGIN="${MARGIN:-0.2}"
+# MARGIN is bounded by the TEACHERS' own separation: max achievable s_pos-s_neg =
+# 1-cos(h_pos,h_neg) ~= 0.04-0.09 on the kept layers (layer_sel probe, n=500).
+# 0.2 would be unsatisfiable (hinge_active_frac pinned at 1). 0.05 ~= the mean.
+MARGIN="${MARGIN:-0.05}"
 GROUNDING_WEIGHT="${GROUNDING_WEIGHT:-1.0}"
 GROUNDING_QUEUE="${GROUNDING_QUEUE:-4096}"
+# From the layer_sel probe (upper third by separation); caches must be built with
+# the same list via --keep_layers.
+ALIGN_IDX="${ALIGN_IDX:-20,21,22,23,24,25,26,27,28}"
 
 SAVE_CKPT="${SAVE_CKPT:-sft_stage2_residual${MARGIN}_ground${GROUNDING_WEIGHT}_latent${LATENT_SIZE}}"
 SAVE="/scratch/$USER/monet_ckpts/${SAVE_CKPT}"
@@ -72,6 +78,7 @@ torchrun --nproc-per-node="${NPROC:-2}" --master-port="${PORT:-29511}" -m src.ma
   --alignment_layer all_layers \
   --teacher_reps_dir "$REPS_POS" \
   --teacher_reps_neg_dir "$REPS_NEG" \
+  --alignment_layer_indices "$ALIGN_IDX" \
   --obs_residual_margin "$MARGIN" \
   --grounding_weight "$GROUNDING_WEIGHT" \
   --grounding_queue_size "$GROUNDING_QUEUE" \
