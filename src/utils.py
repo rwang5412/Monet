@@ -64,6 +64,23 @@ def get_args():
                              "QUESTION image in the teacher forward. REQUIRED for both h_pos and "
                              "h_neg caches of the residual objective (matches the student's "
                              "--observation_tokens_cannot_see_question_image).")
+    parser.add_argument("--probe_fig4", type=int, default=0,
+                        help="precompute_teacher_reps.py: run the Figure-4 PRECONDITION on N "
+                             "samples (obs-token accuracy with vs without aux image, forward "
+                             "only, no caching) and exit. Gap ~0 => warm-up didn't take.")
+    parser.add_argument("--probe_layer_sel", type=int, default=0,
+                        help="precompute_teacher_reps.py: probe per-layer mean(1-cos(h_pos,h_neg)) "
+                             "on N samples (both variants in-memory, no caching), write "
+                             "layer_sel.json to --save_model_path, and exit.")
+    parser.add_argument("--keep_layers", type=str, default=None,
+                        help="precompute_teacher_reps.py: comma-separated hidden-state layer "
+                             "indices to KEEP in the cached reps (from the layer_sel probe). "
+                             "Cuts cache storage; training must pass the same indices via "
+                             "--alignment_layer_indices.")
+    parser.add_argument("--alignment_layer_indices", type=str, default=None,
+                        help="Training: comma-separated layer indices the teacher caches were "
+                             "saved with (--keep_layers); the student hidden-state stack is "
+                             "sliced to match before the alignment/residual loss.")
     parser.add_argument("--sft_stage2_global_img_tokens", type=int, help="Maximum img pixels in a sequence will be sft_stage2_global_max_img_tokens*28*28", default=1500)
     parser.add_argument("--sft_stage2_per_img_tokens", type=int, help="Maximum pixels per img will be sft_stage2_global_max_img_tokens*28*28", default=1280)
     parser.add_argument("--sft_stage3_img_tokens", type=int, help="Maximum img pixels in a sequence will be sft_stage3_max_img_tokens*28*28", default=2000)

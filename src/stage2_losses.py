@@ -74,6 +74,20 @@ class LatentGroundingLoss(nn.Module):
         loss = F.cross_entropy(
             logits, torch.zeros(z.shape[0], dtype=torch.long, device=z.device))
 
+        # Instrumentation (spec §7): InfoNCE top-1 (should climb well above
+        # 1/(Q+1)) and within-block latent similarity (K slots should decorrelate).
+        with torch.no_grad():
+            top1 = (logits.argmax(dim=1) == 0).float().mean().item()
+            wb = []
+            for z_b in latents:
+                if z_b is not None and z_b.shape[0] > 1:
+                    zn = F.normalize(z_b.float(), dim=-1)
+                    c = zn @ zn.T
+                    k = c.shape[0]
+                    wb.append(((c.sum() - k) / (k * (k - 1))).item())
+            self.last_stats = {"nce_top1": top1,
+                               "within_block_sim": sum(wb) / len(wb) if wb else None}
+
         if enqueue:
             self._enqueue(v)
         return loss

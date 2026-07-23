@@ -419,6 +419,7 @@ elif args.stage in ['sft_stage2','sft_stage3']:
     setattr(training_args, 'teacher_reps_neg_dir', args.teacher_reps_neg_dir)
     setattr(training_args, 'obs_residual_margin', args.obs_residual_margin)
     setattr(training_args, 'grounding_weight', args.grounding_weight)
+    setattr(training_args, 'alignment_layer_indices', args.alignment_layer_indices)
 
 # Initialize the trainer (callbacks that need trainer instance will be added after)
 trainer = CustomTrainer(

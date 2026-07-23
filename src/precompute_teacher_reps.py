@@ -64,6 +64,10 @@ for i, sample in tqdm(enumerate(all_train_dataset[:]), desc="Collecting training
     if processed is not None:
         train_dataset.append(processed)
 
+# Subset support (pilots + the fig4/layer_sel probes).
+if getattr(args, 'num_samples', -1) and args.num_samples > 0:
+    train_dataset = train_dataset[:args.num_samples]
+
 
 # ================= Prepare tokenizer special ids and misc =================
 processor.tokenizer.add_tokens("<abs_vis_token_pad>", special_tokens=True)
@@ -285,6 +289,117 @@ def _filter_indices_by_resume(train_dataset: list, args, align_poss = "obs") -> 
             keep.append(idx)
     return keep
 
+def _probe_forward(examples, no_aux: bool, device, want_acc: bool):
+    """One teacher forward for the probes: both aux variants share this path.
+    Returns (mean_obs_token_acc, hidden_states_list) -- hidden states are the
+    per-sample [num_layer, T_obs, D] stacks the normal precompute would cache.
+    Masking follows --teacher_obs_mask exactly like the caching path, so probe
+    numbers reflect the same regime the caches will be built under."""
+    prev = getattr(args, 'no_aux_images', False)
+    args.no_aux_images = no_aux
+    try:
+        batch = collate_fn_precompute_teacher_rep(examples)
+    finally:
+        args.no_aux_images = prev
+    alignment_poss = batch['teacher_observation_poss']
+    labels = generate_labels_after_multi_token_start(
+        batch["teacher_input_ids"], answer_start_pattern,
+        ignore_ids=[end_pad_token_idx, img_pad_idx, img_start_idx, img_end_idx,
+                    observation_start_idx, observation_end_idx])
+    inputs = {
+        'latent_mode': False,
+        'input_ids': batch['teacher_input_ids'].to(device),
+        'attention_mask': batch['teacher_attention_mask'].to(device),
+        'pixel_values': batch['teacher_pixel_values'].to(device),
+        'image_grid_thw': batch['teacher_image_grid_thw'].to(device),
+        'alignment_poss': alignment_poss,
+        'output_hidden_states': True,
+        'loss_type': [],
+    }
+    if want_acc:
+        inputs['labels'] = labels.to(device)
+        inputs['loss_type'] = ['ce']
+        inputs['ce_emphasize_poss'] = alignment_poss
+        inputs['ce_emphasize_factor'] = 1.0
+        inputs['compute_emphasize_acc'] = True
+    if getattr(args, 'teacher_obs_mask', False):
+        m4d = build_teacher_obs_mask(batch['teacher_input_ids'],
+                                     batch['teacher_attention_mask'], alignment_poss)
+        inputs['attention_mask_4d'] = {"full_attention": m4d.to(device)}
+    out = model(**inputs, return_dict=True)
+    acc = getattr(out, 'mean_emphasize_acc', None)
+    return acc, out.hidden_states
+
+
+def probe_fig4(device, n: int):
+    """§0 precondition: obs-token prediction accuracy WITH vs WITHOUT the aux
+    image on the frozen warm-up teacher. Gap ~0 => warm-up didn't take; stage-2
+    residual training would be flat regardless of implementation."""
+    accs_pos, accs_neg = [], []
+    with torch.inference_mode():
+        for ex in tqdm(train_dataset[:n], desc="fig4 probe"):
+            try:
+                a_pos, _ = _probe_forward([ex], no_aux=False, device=device, want_acc=True)
+                a_neg, _ = _probe_forward([ex], no_aux=True, device=device, want_acc=True)
+            except Exception as e:
+                logging.warning(f"fig4 probe skip: {e}")
+                continue
+            if a_pos is not None and a_neg is not None:
+                accs_pos.append(a_pos)
+                accs_neg.append(a_neg)
+    n_ok = len(accs_pos)
+    mp = sum(accs_pos) / max(n_ok, 1)
+    mn = sum(accs_neg) / max(n_ok, 1)
+    print("=" * 60)
+    print(f"  Figure-4 precondition  (n={n_ok}, teacher_obs_mask={getattr(args,'teacher_obs_mask',False)})")
+    print(f"  obs-token acc WITH aux    = {mp:.4f}")
+    print(f"  obs-token acc WITHOUT aux = {mn:.4f}")
+    print(f"  GAP = {mp - mn:+.4f}   (substantial => proceed; ~0 => re-run Stage 1)")
+    print("=" * 60)
+
+
+def probe_layer_sel(device, n: int):
+    """§2 layer selection: per-layer mean(1 - cos(h_pos, h_neg)) over obs tokens.
+    Layers where the two teachers already agree contribute only noise under the
+    margin loss. Writes layer_sel.json (upper-third by separation) to save dir."""
+    import json as _json
+    sep_sum, sep_cnt = None, 0
+    with torch.inference_mode():
+        for ex in tqdm(train_dataset[:n], desc="layer_sel probe"):
+            try:
+                _, h_pos = _probe_forward([ex], no_aux=False, device=device, want_acc=False)
+                _, h_neg = _probe_forward([ex], no_aux=True, device=device, want_acc=False)
+            except Exception as e:
+                logging.warning(f"layer_sel probe skip: {e}")
+                continue
+            hp, hn = h_pos[0].float(), h_neg[0].float()   # [num_layer, T_obs, D]
+            if hp.shape != hn.shape or hp.numel() == 0:
+                continue
+            sep = (1 - torch.nn.functional.cosine_similarity(hp, hn, dim=-1)).mean(dim=1)  # [num_layer]
+            sep_sum = sep if sep_sum is None else sep_sum + sep
+            sep_cnt += 1
+    assert sep_cnt > 0, "layer_sel probe: no usable samples"
+    sep_mean = (sep_sum / sep_cnt).cpu()
+    order = torch.argsort(sep_mean, descending=True)
+    k = max(1, len(sep_mean) // 3)                        # upper third
+    selected = sorted(order[:k].tolist())
+    os.makedirs(args.save_model_path, exist_ok=True)
+    out_path = os.path.join(args.save_model_path, "layer_sel.json")
+    _json.dump({"selected_layers": selected, "n_probe": sep_cnt,
+                "per_layer_separation": sep_mean.tolist(),
+                "teacher_obs_mask": bool(getattr(args, 'teacher_obs_mask', False))},
+               open(out_path, "w"), indent=2)
+    print("=" * 60)
+    print(f"  Layer-selection probe (n={sep_cnt})")
+    for i, s in enumerate(sep_mean.tolist()):
+        tag = "  <== KEEP" if i in selected else ""
+        print(f"    layer {i:2d}  mean(1-cos(h_pos,h_neg)) = {s:.4f}{tag}")
+    print(f"  wrote {out_path}")
+    print(f"  use in caching:  --keep_layers {','.join(map(str, selected))}")
+    print(f"  use in training: --alignment_layer_indices {','.join(map(str, selected))}")
+    print("=" * 60)
+
+
 def main():
     # Initialize distributed if requested
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -299,9 +414,24 @@ def main():
         device = _device()
         model.to(device)
 
+        # ---- probe modes: forward-only, no caching, single process ----
+        if getattr(args, 'probe_fig4', 0) > 0:
+            probe_fig4(device, args.probe_fig4)
+            return
+        if getattr(args, 'probe_layer_sel', 0) > 0:
+            probe_layer_sel(device, args.probe_layer_sel)
+            return
+
         # Save dir for latents
         out_dir = args.save_model_path
         os.makedirs(out_dir, exist_ok=True)
+
+        keep_layers = None
+        if getattr(args, 'keep_layers', None):
+            keep_layers = [int(x) for x in args.keep_layers.split(',') if x.strip() != '']
+            if rank == 0:
+                logging.info(f"[precompute] caching ONLY hidden-state layers {keep_layers} "
+                             f"(training must pass --alignment_layer_indices {args.keep_layers})")
 
         # Iterate data and precompute
         bs = max(1, int(getattr(args, 'bsz', 1)))
@@ -402,7 +532,13 @@ def main():
                         elif args.sft_stage2_align_poss == 'latent_end':
                             metadata_str = f"rep_latent_end_{metadata_info}.pt"
                         save_path = os.path.join(out_dir, metadata_str)
-                        torch.save({'metadata_info': metadata_info, 'latent': teacher_reps[b].detach().cpu()}, save_path)
+                        rep = teacher_reps[b].detach()
+                        if keep_layers is not None and rep.dim() == 3:  # [num_layer, T, D]
+                            rep = rep[keep_layers]
+                        # fp16 halves cache size; cosine/margin losses are insensitive at this precision
+                        torch.save({'metadata_info': metadata_info,
+                                    'latent': rep.to(torch.float16).cpu(),
+                                    'keep_layers': keep_layers}, save_path)
                 except Exception as e:
                     logging.exception(f"[rank {rank}] Failed at batch start={i}, ids={cur_ids}: {e}")
                     # Continue processing other batches instead of crashing and hanging other ranks

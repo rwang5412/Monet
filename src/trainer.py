@@ -153,6 +153,14 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
         self.grounding_weight = float(getattr(self.args, 'grounding_weight', 0.0))
         self.grounding_loss_cum = 0.
         self.grounding_loss_steps = 0
+        # --keep_layers'd caches need the student stack sliced to the same layers
+        _ali = getattr(self.args, 'alignment_layer_indices', None)
+        self.alignment_layer_indices = ([int(x) for x in _ali.split(',')] if _ali else None)
+        # instrumentation accumulators (spec §7)
+        self._s2_stats = {k: [0.0, 0] for k in
+                          ("residual_gap", "hinge_active_frac", "nce_top1",
+                           "within_block_sim", "cross_sample_sim")}
+        self._z_ring = []  # recent pooled latents for cross-sample similarity
 
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -203,6 +211,8 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
                 alignment_layer=self.args.alignment_layer)
                 inputs['teacher_hidden_states_for_alignment_neg'] = teacher_reps_neg
                 inputs['obs_residual_margin'] = float(getattr(self.args, 'obs_residual_margin', 0.2))
+            if self.alignment_layer_indices is not None:
+                inputs['alignment_layer_indices'] = self.alignment_layer_indices
 
         teacher_ce_loss, teacher_output = super().compute_loss(
                 model,
@@ -231,6 +241,31 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
                                            aux_feats, enqueue=False)
             self.grounding_loss_cum += float(grounding_writer.detach().item())
             self.grounding_loss_steps += 1
+            gs = getattr(grounding_mod, 'last_stats', None)
+            if gs:
+                for k in ("nce_top1", "within_block_sim"):
+                    if gs.get(k) is not None:
+                        self._s2_stats[k][0] += gs[k]
+                        self._s2_stats[k][1] += 1
+
+        # instrumentation: residual stats from the CE forward; cross-sample latent sim
+        ld = getattr(teacher_output, 'loss_dict', None) or {}
+        for k in ("residual_gap", "hinge_active_frac"):
+            if k in ld:
+                self._s2_stats[k][0] += float(ld[k])
+                self._s2_stats[k][1] += 1
+        with torch.no_grad():
+            for z_b in outputs.ce_patch_vec:
+                if z_b is not None and z_b.numel():
+                    self._z_ring.append(torch.nn.functional.normalize(
+                        z_b.detach().float().mean(dim=0), dim=-1).cpu())
+            self._z_ring = self._z_ring[-64:]
+            if len(self._z_ring) >= 8:
+                Z = torch.stack(self._z_ring)
+                C = Z @ Z.T
+                n = C.shape[0]
+                self._s2_stats["cross_sample_sim"][0] += float((C.sum() - n) / (n * (n - 1)))
+                self._s2_stats["cross_sample_sim"][1] += 1
 
         # Latent-routed auxiliary total (alignment/residual + grounding), then the
         # latent-only backprop surrogate: stop_grad(dL/d_latent)^T . latent.
@@ -288,6 +323,10 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
             merged["grounding_loss"] = round(self.grounding_loss_cum / max(1, self.grounding_loss_steps), 6)
             self.grounding_loss_cum = 0.
             self.grounding_loss_steps = 0
+        for k, (s, c) in self._s2_stats.items():
+            if c > 0:
+                merged[k] = round(s / c, 4)
+                self._s2_stats[k] = [0.0, 0]
         if self.observation_token_acc_step > 0:
             merged["observation_token_acc"] = round(self.observation_token_acc/ max(1, self.observation_token_acc_step), 6)
             self.observation_token_acc = 0.
