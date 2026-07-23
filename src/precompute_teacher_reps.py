@@ -31,6 +31,12 @@ import random
 import wandb
 args=get_args()
 assert args.save_model_path != "./checkpoints/", "You must specify the save path of the latent embeddings"
+if not getattr(args, 'teacher_obs_mask', False):
+    print("WARNING: --teacher_obs_mask is OFF. For the RESIDUAL objective both "
+          "teacher caches (h_pos AND h_neg) must be computed with it ON, or the "
+          "obs states read the answer region straight off the question image and "
+          "s_pos ~= s_neg (flat margin). Only omit it to reproduce the paper's "
+          "original absolute-alignment cache.")
 config = Qwen2_5_VLConfig.from_pretrained(args.load_model_path)
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     args.load_model_path,
@@ -176,6 +182,55 @@ def collate_fn_precompute_teacher_rep(examples, alignment="boxed_start"):
     return batch
 
 
+def build_teacher_obs_mask(input_ids: torch.Tensor, pad_mask: torch.Tensor,
+                           obs_poss: list) -> torch.Tensor:
+    """4D attention mask for the TEACHER passes of the residual objective.
+
+    Rule: observation-token rows may NOT attend to QUESTION-image tokens (any
+    vision span occurring before the first assistant marker). Everything else is
+    plain causal+padding. Consequences per pass:
+      * with-aux (h_pos):  obs see the aux image (assistant turn, causal) but
+        not the question image  -> encodes text + VISUAL residual
+      * no-aux  (h_neg):   there is no aux image -> obs see no image at all
+        -> encodes text only
+    The student's build_4d_attn cannot be reused here: all its obs rules are
+    gated on the presence of a latent block, which teacher sequences lack.
+    Returns allowed: BoolTensor [B, 1, L, L].
+    """
+    ids_cpu = input_ids.cpu()
+    B, L = ids_cpu.shape
+    causal = torch.tril(torch.ones((L, L), dtype=torch.bool))
+    allowed = causal.unsqueeze(0).repeat(B, 1, 1)
+    valid = pad_mask.cpu().bool()
+    for b in range(B):
+        allowed[b] &= valid[b].unsqueeze(0)
+        allowed[b] &= valid[b].unsqueeze(1)
+        if not obs_poss[b]:
+            continue
+        row = ids_cpu[b]
+        # first assistant marker = end of the question region
+        pat = answer_start_pattern
+        k = int(pat.numel())
+        ans_start = -1
+        for s in range(0, L - k + 1):
+            if torch.equal(row[s:s+k], pat):
+                ans_start = s
+                break
+        if ans_start == -1:
+            continue
+        v_starts = torch.nonzero(row == img_start_idx.item(), as_tuple=False).flatten()
+        v_ends = torch.nonzero(row == img_end_idx.item(), as_tuple=False).flatten()
+        q_img = []
+        for s_, e_ in zip(v_starts.tolist(), v_ends.tolist()):
+            if e_ < ans_start:  # a question-image span
+                q_img.extend(range(s_, e_ + 1))
+        if not q_img:
+            continue
+        o_idx = torch.tensor(obs_poss[b], dtype=torch.long)
+        allowed[b][o_idx.unsqueeze(1), torch.tensor(q_img, dtype=torch.long)] = False
+    return allowed.unsqueeze(1)  # [B, 1, L, L]
+
+
 def _device() -> torch.device:
     if torch.cuda.is_available():
         local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
@@ -314,6 +369,13 @@ def main():
                         'alignment_poss': alignment_poss,
                         'loss_type': [],
                     }
+                    if getattr(args, 'teacher_obs_mask', False):
+                        # Residual-objective teacher mask: obs rows blind to the
+                        # question image (see build_teacher_obs_mask docstring).
+                        m4d = build_teacher_obs_mask(
+                            batch['teacher_input_ids'], batch['teacher_attention_mask'],
+                            alignment_poss)
+                        inputs['attention_mask_4d'] = {"full_attention": m4d.to(device)}
                     if args.output_latent_embeds:
                         inputs['output_latent_embeds'] = True
                     if args.output_hidden_states:

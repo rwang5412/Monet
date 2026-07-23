@@ -59,6 +59,11 @@ def get_args():
     parser.add_argument("--no_aux_images", action='store_true', default=False,
                         help="precompute_teacher_reps.py only: run the teacher WITHOUT auxiliary "
                              "images (produces the h_neg cache for the residual objective).")
+    parser.add_argument("--teacher_obs_mask", action='store_true', default=False,
+                        help="precompute_teacher_reps.py only: block observation tokens from the "
+                             "QUESTION image in the teacher forward. REQUIRED for both h_pos and "
+                             "h_neg caches of the residual objective (matches the student's "
+                             "--observation_tokens_cannot_see_question_image).")
     parser.add_argument("--sft_stage2_global_img_tokens", type=int, help="Maximum img pixels in a sequence will be sft_stage2_global_max_img_tokens*28*28", default=1500)
     parser.add_argument("--sft_stage2_per_img_tokens", type=int, help="Maximum pixels per img will be sft_stage2_global_max_img_tokens*28*28", default=1280)
     parser.add_argument("--sft_stage3_img_tokens", type=int, help="Maximum img pixels in a sequence will be sft_stage3_max_img_tokens*28*28", default=2000)
