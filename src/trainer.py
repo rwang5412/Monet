@@ -195,24 +195,38 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
         inputs.pop('attn_analysis', None)
 
         if self.args.alignment_weight != 0:
-            # Load precomputed teacher representations of observation tokens for alignment loss
-            teacher_reps = load_offline_tensor(self.args.teacher_reps_dir, batch_metadata=inputs['metadata'],
-            alignment_layer=self.args.alignment_layer)
-            inputs['alignment_poss'] = inputs['observation_poss']
-
-            inputs['teacher_hidden_states_for_alignment'] = teacher_reps
-
-            # Change 1 (residual objective): also load the NO-aux-image teacher
-            # cache; the modeling alignment block then computes the margin form
-            # (closer to with-image teacher than to without-image teacher) instead
-            # of the absolute cosine. Same filename pattern, separate directory.
-            if self.teacher_reps_neg_dir:
-                teacher_reps_neg = load_offline_tensor(self.teacher_reps_neg_dir, batch_metadata=inputs['metadata'],
+            # Load precomputed teacher representations of observation tokens for
+            # the alignment loss. ~0.6% of rows failed the teacher collate and
+            # have no cache file; those samples run CE-only (alignment skipped)
+            # rather than crashing a multi-day run.
+            try:
+                teacher_reps = load_offline_tensor(self.args.teacher_reps_dir, batch_metadata=inputs['metadata'],
                 alignment_layer=self.args.alignment_layer)
-                inputs['teacher_hidden_states_for_alignment_neg'] = teacher_reps_neg
-                inputs['obs_residual_margin'] = float(getattr(self.args, 'obs_residual_margin', 0.2))
-            if self.alignment_layer_indices is not None:
-                inputs['alignment_layer_indices'] = self.alignment_layer_indices
+                # Change 1 (residual objective): also load the NO-aux-image teacher
+                # cache; the modeling alignment block then computes the margin form
+                # (closer to with-image teacher than to without-image teacher)
+                # instead of the absolute cosine. Same filenames, separate dir.
+                teacher_reps_neg = None
+                if self.teacher_reps_neg_dir:
+                    teacher_reps_neg = load_offline_tensor(self.teacher_reps_neg_dir, batch_metadata=inputs['metadata'],
+                    alignment_layer=self.args.alignment_layer)
+            except RuntimeError as e:
+                self._missing_reps = getattr(self, '_missing_reps', 0) + 1
+                if self._missing_reps <= 5 or self._missing_reps % 100 == 0:
+                    logging.warning(f"teacher reps missing (#{self._missing_reps}); CE-only step. {e}")
+                teacher_reps = None
+                # drop the alignment objective for this step or the modeling
+                # block would dereference the absent teacher tensors
+                inputs['loss_type'] = ['ce']
+
+            if teacher_reps is not None:
+                inputs['alignment_poss'] = inputs['observation_poss']
+                inputs['teacher_hidden_states_for_alignment'] = teacher_reps
+                if teacher_reps_neg is not None:
+                    inputs['teacher_hidden_states_for_alignment_neg'] = teacher_reps_neg
+                    inputs['obs_residual_margin'] = float(getattr(self.args, 'obs_residual_margin', 0.2))
+                if self.alignment_layer_indices is not None:
+                    inputs['alignment_layer_indices'] = self.alignment_layer_indices
 
         teacher_ce_loss, teacher_output = super().compute_loss(
                 model,
