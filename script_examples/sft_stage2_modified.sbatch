@@ -58,9 +58,12 @@ cd "${REPO_DIR:-$SLURM_SUBMIT_DIR}"
 mkdir -p "/scratch/$USER/logs" "$SAVE"
 
 # Fail fast if the caches are missing (cheaper than dying mid-epoch).
+# NOTE: no `ls | head` here -- with 118K files head's early exit SIGPIPEs ls and
+# pipefail kills the job (exit 141). find -quit stops after the first match.
 for d in "$REPS_POS" "$REPS_NEG"; do
-  n=$(ls "$d" 2>/dev/null | head -50 | wc -l)
-  if [ "$n" -eq 0 ]; then echo "FATAL: teacher rep cache empty/missing: $d"; exit 1; fi
+  first=$(find "$d" -maxdepth 1 -name 'rep_*.pt' -print -quit 2>/dev/null)
+  if [ -z "$first" ]; then echo "FATAL: teacher rep cache empty/missing: $d"; exit 1; fi
+  echo "cache OK: $d (found $first)"
 done
 
 torchrun --nproc-per-node="${NPROC:-8}" --master-port="${PORT:-29511}" -m src.main \
