@@ -57,6 +57,22 @@ conda activate monet
 cd "${REPO_DIR:-$SLURM_SUBMIT_DIR}"
 mkdir -p "/scratch/$USER/logs" "$SAVE"
 
+# DeepSpeed JIT-compiles CUDA ops at engine init and needs the CUDA toolkit
+# (CUDA_HOME/nvcc) -- not provided by the conda env. Load the cluster module.
+module load cuda 2>/dev/null || module load cuda/12.4 2>/dev/null \
+  || module load cuda/12.1 2>/dev/null || true
+if ! command -v nvcc >/dev/null 2>&1; then
+  echo "FATAL: nvcc not found after 'module load cuda'. Run 'module avail cuda' and"
+  echo "       resubmit with CUDA_MODULE=<name>, or fix the module name in this script."
+  [ -n "${CUDA_MODULE:-}" ] && module load "$CUDA_MODULE" || true
+fi
+command -v nvcc >/dev/null 2>&1 || { echo "FATAL: still no nvcc"; exit 1; }
+export CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}"
+echo "CUDA_HOME=$CUDA_HOME ($(nvcc --version | tail -1))"
+# Triton autotune cache off NFS (silences the DeepSpeed warning, avoids exit hangs)
+export TRITON_CACHE_DIR="/scratch/$USER/.triton_cache"
+mkdir -p "$TRITON_CACHE_DIR"
+
 # Fail fast if the caches are missing (cheaper than dying mid-epoch).
 # NOTE: no `ls | head` here -- with 118K files head's early exit SIGPIPEs ls and
 # pipefail kills the job (exit 141). find -quit stops after the first match.
