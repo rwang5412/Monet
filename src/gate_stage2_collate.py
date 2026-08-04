@@ -45,11 +45,14 @@ def _absolutize(row: dict, root: str) -> list:
 
 
 def _obs_poss(input_ids, ids):
+    """Match the TRAINING/CACHE convention exactly: range(start, end) -- the
+    span INCLUDES the <observation> tag token (main.py collates and
+    precompute_teacher_reps both do this); excludes </observation>."""
     starts = find_ids_poss(input_ids, ids["ans_start"], ids["obs_start"])
     ends = find_ids_poss(input_ids, ids["ans_start"], ids["obs_end"])
     poss = []
     for s_, e_ in zip(starts[0], ends[0]):
-        poss.extend(range(s_ + 1, e_))
+        poss.extend(range(s_, e_))
     return poss
 
 

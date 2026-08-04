@@ -2115,6 +2115,16 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     all_student_hidden_states = all_student_hidden_states[alignment_layer_indices]
                 for b in range(batch_size):
                     student_hidden_states = all_student_hidden_states[:, b, alignment_poss[b], :]
+                    # Guard: teacher caches were tokenized separately; a count
+                    # mismatch must skip the sample, not kill a multi-day run.
+                    if (teacher_hidden_states_for_alignment is not None
+                            and teacher_hidden_states_for_alignment[b].dim() == 3
+                            and teacher_hidden_states_for_alignment[b].shape[-2]
+                                != student_hidden_states.shape[-2]):
+                        print(f"[align] obs-count mismatch (teacher "
+                              f"{teacher_hidden_states_for_alignment[b].shape[-2]} vs student "
+                              f"{student_hidden_states.shape[-2]}); skipping alignment for this sample")
+                        continue
                     if teacher_hidden_states_for_alignment_neg is not None:
                         # Stage-2 residual objective: student obs states must be
                         # closer to the with-aux-image teacher than to the

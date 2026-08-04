@@ -249,12 +249,23 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
             grounding_mod = getattr(m, 'latent_grounding', None)
             assert grounding_mod is not None, \
                 "grounding_weight != 0 but model has no latent_grounding module (attach it in main.py)"
-            aux_feats = getattr(outputs, 'aux_image_feats', None) or [None] * len(outputs.ce_patch_vec)
-            grounding_writer = grounding_mod(outputs.ce_patch_vec, aux_feats, enqueue=True)
-            grounding_proj = grounding_mod([z.detach() for z in outputs.ce_patch_vec],
-                                           aux_feats, enqueue=False)
-            self.grounding_loss_cum += float(grounding_writer.detach().item())
-            self.grounding_loss_steps += 1
+            try:
+                aux_feats = getattr(outputs, 'aux_image_feats', None) or [None] * len(outputs.ce_patch_vec)
+                grounding_writer = grounding_mod(outputs.ce_patch_vec, aux_feats, enqueue=True)
+                grounding_proj = grounding_mod([z.detach() for z in outputs.ce_patch_vec],
+                                               aux_feats, enqueue=False)
+                if not grounding_writer.requires_grad:  # all samples skipped inside the module
+                    grounding_writer = None
+            except Exception as e:
+                # A weird sample (empty obs span / no latents) must not kill a
+                # multi-day run; skip the term this step, loudly but rate-limited.
+                self._grounding_skips = getattr(self, '_grounding_skips', 0) + 1
+                if self._grounding_skips <= 5 or self._grounding_skips % 100 == 0:
+                    logging.warning(f"grounding skipped (#{self._grounding_skips}): {e!r}")
+                grounding_writer = None
+            if grounding_writer is not None:
+                self.grounding_loss_cum += float(grounding_writer.detach().item())
+                self.grounding_loss_steps += 1
             gs = getattr(grounding_mod, 'last_stats', None)
             if gs:
                 for k in ("nce_top1", "within_block_sim"):
