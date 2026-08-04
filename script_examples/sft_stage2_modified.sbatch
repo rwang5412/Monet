@@ -58,15 +58,13 @@ cd "${REPO_DIR:-$SLURM_SUBMIT_DIR}"
 mkdir -p "/scratch/$USER/logs" "$SAVE"
 
 # DeepSpeed JIT-compiles CUDA ops at engine init and needs the CUDA toolkit
-# (CUDA_HOME/nvcc) -- not provided by the conda env. Load the cluster module.
-module load cuda 2>/dev/null || module load cuda/12.4 2>/dev/null \
-  || module load cuda/12.1 2>/dev/null || true
-if ! command -v nvcc >/dev/null 2>&1; then
-  echo "FATAL: nvcc not found after 'module load cuda'. Run 'module avail cuda' and"
-  echo "       resubmit with CUDA_MODULE=<name>, or fix the module name in this script."
-  [ -n "${CUDA_MODULE:-}" ] && module load "$CUDA_MODULE" || true
-fi
-command -v nvcc >/dev/null 2>&1 || { echo "FATAL: still no nvcc"; exit 1; }
+# (CUDA_HOME/nvcc) -- not provided by the conda env. The toolkit MAJOR version
+# must match torch's CUDA build (12.x): Palmetto's default module is cuda/13,
+# so we pin 12.3.0 unless CUDA_MODULE overrides.
+CUDA_MODULE="${CUDA_MODULE:-cuda/12.3.0}"
+module load "$CUDA_MODULE" 2>/dev/null || module load cuda 2>/dev/null || true
+command -v nvcc >/dev/null 2>&1 || { \
+  echo "FATAL: nvcc not found (tried $CUDA_MODULE). Run 'module avail cuda' and resubmit with CUDA_MODULE=<name>."; exit 1; }
 export CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}"
 echo "CUDA_HOME=$CUDA_HOME ($(nvcc --version | tail -1))"
 # Triton autotune cache off NFS (silences the DeepSpeed warning, avoids exit hangs)
