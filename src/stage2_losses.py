@@ -72,7 +72,10 @@ class LatentGroundingLoss(nn.Module):
         v = F.normalize(torch.stack(vs).float().to(z.device), dim=-1).detach()    # (B, D)
 
         pos = (z * v).sum(-1, keepdim=True)                                # (B, 1)
-        neg = z @ self.queue[: max(int(self.filled), 1)].to(z.device, z.dtype).T  # (B, Q_filled)
+        # .clone() is load-bearing: the matmul saves its input for backward, and
+        # _enqueue() mutates the queue buffer IN PLACE before HF runs backward
+        # -> "modified by an inplace operation" crash without it (MoCo pattern).
+        neg = z @ self.queue[: max(int(self.filled), 1)].to(z.device, z.dtype).clone().T  # (B, Q_filled)
         logits = torch.cat([pos, neg], dim=1) / self.temp
         loss = F.cross_entropy(
             logits, torch.zeros(z.shape[0], dtype=torch.long, device=z.device))
