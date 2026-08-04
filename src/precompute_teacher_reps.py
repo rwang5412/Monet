@@ -31,6 +31,12 @@ import random
 import wandb
 args=get_args()
 assert args.save_model_path != "./checkpoints/", "You must specify the save path of the latent embeddings"
+if not getattr(args, 'teacher_obs_mask', False):
+    print("WARNING: --teacher_obs_mask is OFF. For the RESIDUAL objective both "
+          "teacher caches (h_pos AND h_neg) must be computed with it ON, or the "
+          "obs states read the answer region straight off the question image and "
+          "s_pos ~= s_neg (flat margin). Only omit it to reproduce the paper's "
+          "original absolute-alignment cache.")
 config = Qwen2_5_VLConfig.from_pretrained(args.load_model_path)
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     args.load_model_path,
@@ -57,6 +63,10 @@ for i, sample in tqdm(enumerate(all_train_dataset[:]), desc="Collecting training
     processed = preprocess_function(sample, dataset_root=args.dataset_root)
     if processed is not None:
         train_dataset.append(processed)
+
+# Subset support (pilots + the fig4/layer_sel probes).
+if getattr(args, 'num_samples', -1) and args.num_samples > 0:
+    train_dataset = train_dataset[:args.num_samples]
 
 
 # ================= Prepare tokenizer special ids and misc =================
@@ -116,11 +126,29 @@ def collate_fn_precompute_teacher_rep(examples, alignment="boxed_start"):
     batch = {}
     batch['metadata'] = [ex['metadata'] for ex in examples]
     examples = [ex['data'] for ex in examples]
-    texts = [processor.apply_chat_template(ex, tokenize=False) for ex in examples]
 
-    # replace <abs_vis_token></abs_vis_token> with <|vision_start|><|image_pad|><|vision_end|> for each <|im_start|>assistant content
-    texts = [replace_latent_placeholder_with_img_pad(text) for text in texts]
-    
+    if getattr(args, 'no_aux_images', False):
+        # h_neg mode (Stage-2 residual objective): the teacher sees the SAME text
+        # CoT but NO auxiliary images and no latent placeholders -- pure text +
+        # question image. The observation-token COUNT is unchanged (only image
+        # pads / placeholders are removed), so the saved reps align 1:1 with the
+        # with-aux h_pos cache. The question (user) part gets the same
+        # process_multiple_question_img treatment as the with-aux path so the two
+        # caches differ ONLY by the auxiliary image.
+        examples = remove_auxiliary_images(examples)
+        texts = []
+        for ex in examples:
+            t = processor.apply_chat_template(ex, tokenize=False)
+            parts = t.split("<|im_start|>assistant")
+            out = process_multiple_question_img(parts[0])
+            for p in parts[1:]:
+                out += "<|im_start|>assistant" + p.replace("<abs_vis_token></abs_vis_token>", "")
+            texts.append(out)
+    else:
+        texts = [processor.apply_chat_template(ex, tokenize=False) for ex in examples]
+        # replace <abs_vis_token></abs_vis_token> with <|vision_start|><|image_pad|><|vision_end|> for each <|im_start|>assistant content
+        texts = [replace_latent_placeholder_with_img_pad(text) for text in texts]
+
     ################################################
     # teacher
     ################################################
@@ -156,6 +184,55 @@ def collate_fn_precompute_teacher_rep(examples, alignment="boxed_start"):
         batch["latent_end_poss"] = find_ids_poss(batch["teacher_input_ids"], answer_start_pattern, latent_end_idx)
 
     return batch
+
+
+def build_teacher_obs_mask(input_ids: torch.Tensor, pad_mask: torch.Tensor,
+                           obs_poss: list) -> torch.Tensor:
+    """4D attention mask for the TEACHER passes of the residual objective.
+
+    Rule: observation-token rows may NOT attend to QUESTION-image tokens (any
+    vision span occurring before the first assistant marker). Everything else is
+    plain causal+padding. Consequences per pass:
+      * with-aux (h_pos):  obs see the aux image (assistant turn, causal) but
+        not the question image  -> encodes text + VISUAL residual
+      * no-aux  (h_neg):   there is no aux image -> obs see no image at all
+        -> encodes text only
+    The student's build_4d_attn cannot be reused here: all its obs rules are
+    gated on the presence of a latent block, which teacher sequences lack.
+    Returns allowed: BoolTensor [B, 1, L, L].
+    """
+    ids_cpu = input_ids.cpu()
+    B, L = ids_cpu.shape
+    causal = torch.tril(torch.ones((L, L), dtype=torch.bool))
+    allowed = causal.unsqueeze(0).repeat(B, 1, 1)
+    valid = pad_mask.cpu().bool()
+    for b in range(B):
+        allowed[b] &= valid[b].unsqueeze(0)
+        allowed[b] &= valid[b].unsqueeze(1)
+        if not obs_poss[b]:
+            continue
+        row = ids_cpu[b]
+        # first assistant marker = end of the question region
+        pat = answer_start_pattern
+        k = int(pat.numel())
+        ans_start = -1
+        for s in range(0, L - k + 1):
+            if torch.equal(row[s:s+k], pat):
+                ans_start = s
+                break
+        if ans_start == -1:
+            continue
+        v_starts = torch.nonzero(row == img_start_idx.item(), as_tuple=False).flatten()
+        v_ends = torch.nonzero(row == img_end_idx.item(), as_tuple=False).flatten()
+        q_img = []
+        for s_, e_ in zip(v_starts.tolist(), v_ends.tolist()):
+            if e_ < ans_start:  # a question-image span
+                q_img.extend(range(s_, e_ + 1))
+        if not q_img:
+            continue
+        o_idx = torch.tensor(obs_poss[b], dtype=torch.long)
+        allowed[b][o_idx.unsqueeze(1), torch.tensor(q_img, dtype=torch.long)] = False
+    return allowed.unsqueeze(1)  # [B, 1, L, L]
 
 
 def _device() -> torch.device:
@@ -212,6 +289,120 @@ def _filter_indices_by_resume(train_dataset: list, args, align_poss = "obs") -> 
             keep.append(idx)
     return keep
 
+def _probe_forward(examples, no_aux: bool, device, want_acc: bool):
+    """One teacher forward for the probes: both aux variants share this path.
+    Returns (mean_obs_token_acc, hidden_states_list) -- hidden states are the
+    per-sample [num_layer, T_obs, D] stacks the normal precompute would cache.
+    Masking follows --teacher_obs_mask exactly like the caching path, so probe
+    numbers reflect the same regime the caches will be built under."""
+    prev = getattr(args, 'no_aux_images', False)
+    args.no_aux_images = no_aux
+    try:
+        batch = collate_fn_precompute_teacher_rep(examples)
+    finally:
+        args.no_aux_images = prev
+    alignment_poss = batch['teacher_observation_poss']
+    labels = generate_labels_after_multi_token_start(
+        batch["teacher_input_ids"], answer_start_pattern,
+        ignore_ids=[end_pad_token_idx, img_pad_idx, img_start_idx, img_end_idx,
+                    observation_start_idx, observation_end_idx])
+    inputs = {
+        'latent_mode': False,
+        'input_ids': batch['teacher_input_ids'].to(device),
+        'attention_mask': batch['teacher_attention_mask'].to(device),
+        'pixel_values': batch['teacher_pixel_values'].to(device),
+        'image_grid_thw': batch['teacher_image_grid_thw'].to(device),
+        'alignment_poss': alignment_poss,
+        'output_hidden_states': True,
+        'loss_type': [],
+    }
+    if want_acc:
+        inputs['labels'] = labels.to(device)
+        inputs['loss_type'] = ['ce']
+        inputs['ce_emphasize_poss'] = alignment_poss
+        inputs['ce_emphasize_factor'] = 1.0
+        inputs['compute_emphasize_acc'] = True
+    if getattr(args, 'teacher_obs_mask', False):
+        m4d = build_teacher_obs_mask(batch['teacher_input_ids'],
+                                     batch['teacher_attention_mask'], alignment_poss)
+        inputs['attention_mask_4d'] = {"full_attention": m4d.to(device)}
+    out = model(**inputs, return_dict=True)
+    acc = getattr(out, 'mean_emphasize_acc', None)
+    return acc, out.hidden_states
+
+
+def probe_fig4(device, n: int):
+    """§0 precondition: obs-token prediction accuracy WITH vs WITHOUT the aux
+    image on the frozen warm-up teacher. Gap ~0 => warm-up didn't take; stage-2
+    residual training would be flat regardless of implementation."""
+    accs_pos, accs_neg = [], []
+    with torch.inference_mode():
+        for ex in tqdm(train_dataset[:n], desc="fig4 probe"):
+            try:
+                a_pos, _ = _probe_forward([ex], no_aux=False, device=device, want_acc=True)
+                a_neg, _ = _probe_forward([ex], no_aux=True, device=device, want_acc=True)
+            except Exception as e:
+                logging.warning(f"fig4 probe skip: {e}")
+                continue
+            if a_pos is not None and a_neg is not None:
+                accs_pos.append(a_pos)
+                accs_neg.append(a_neg)
+    n_ok = len(accs_pos)
+    assert n_ok > 0, ("fig4 probe: no usable samples -- almost certainly the image "
+                      "paths (e.g. flat-extracted zip vs 'Visual_CoT/images/...' "
+                      "references). Fix the layout and rerun.")
+    mp = sum(accs_pos) / max(n_ok, 1)
+    mn = sum(accs_neg) / max(n_ok, 1)
+    print("=" * 60)
+    print(f"  Figure-4 precondition  (n={n_ok}, teacher_obs_mask={getattr(args,'teacher_obs_mask',False)})")
+    print(f"  obs-token acc WITH aux    = {mp:.4f}")
+    print(f"  obs-token acc WITHOUT aux = {mn:.4f}")
+    print(f"  GAP = {mp - mn:+.4f}   (substantial => proceed; ~0 => re-run Stage 1)")
+    print("=" * 60)
+
+
+def probe_layer_sel(device, n: int):
+    """§2 layer selection: per-layer mean(1 - cos(h_pos, h_neg)) over obs tokens.
+    Layers where the two teachers already agree contribute only noise under the
+    margin loss. Writes layer_sel.json (upper-third by separation) to save dir."""
+    import json as _json
+    sep_sum, sep_cnt = None, 0
+    with torch.inference_mode():
+        for ex in tqdm(train_dataset[:n], desc="layer_sel probe"):
+            try:
+                _, h_pos = _probe_forward([ex], no_aux=False, device=device, want_acc=False)
+                _, h_neg = _probe_forward([ex], no_aux=True, device=device, want_acc=False)
+            except Exception as e:
+                logging.warning(f"layer_sel probe skip: {e}")
+                continue
+            hp, hn = h_pos[0].float(), h_neg[0].float()   # [num_layer, T_obs, D]
+            if hp.shape != hn.shape or hp.numel() == 0:
+                continue
+            sep = (1 - torch.nn.functional.cosine_similarity(hp, hn, dim=-1)).mean(dim=1)  # [num_layer]
+            sep_sum = sep if sep_sum is None else sep_sum + sep
+            sep_cnt += 1
+    assert sep_cnt > 0, "layer_sel probe: no usable samples"
+    sep_mean = (sep_sum / sep_cnt).cpu()
+    order = torch.argsort(sep_mean, descending=True)
+    k = max(1, len(sep_mean) // 3)                        # upper third
+    selected = sorted(order[:k].tolist())
+    os.makedirs(args.save_model_path, exist_ok=True)
+    out_path = os.path.join(args.save_model_path, "layer_sel.json")
+    _json.dump({"selected_layers": selected, "n_probe": sep_cnt,
+                "per_layer_separation": sep_mean.tolist(),
+                "teacher_obs_mask": bool(getattr(args, 'teacher_obs_mask', False))},
+               open(out_path, "w"), indent=2)
+    print("=" * 60)
+    print(f"  Layer-selection probe (n={sep_cnt})")
+    for i, s in enumerate(sep_mean.tolist()):
+        tag = "  <== KEEP" if i in selected else ""
+        print(f"    layer {i:2d}  mean(1-cos(h_pos,h_neg)) = {s:.4f}{tag}")
+    print(f"  wrote {out_path}")
+    print(f"  use in caching:  --keep_layers {','.join(map(str, selected))}")
+    print(f"  use in training: --alignment_layer_indices {','.join(map(str, selected))}")
+    print("=" * 60)
+
+
 def main():
     # Initialize distributed if requested
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -226,9 +417,24 @@ def main():
         device = _device()
         model.to(device)
 
+        # ---- probe modes: forward-only, no caching, single process ----
+        if getattr(args, 'probe_fig4', 0) > 0:
+            probe_fig4(device, args.probe_fig4)
+            return
+        if getattr(args, 'probe_layer_sel', 0) > 0:
+            probe_layer_sel(device, args.probe_layer_sel)
+            return
+
         # Save dir for latents
         out_dir = args.save_model_path
         os.makedirs(out_dir, exist_ok=True)
+
+        keep_layers = None
+        if getattr(args, 'keep_layers', None):
+            keep_layers = [int(x) for x in args.keep_layers.split(',') if x.strip() != '']
+            if rank == 0:
+                logging.info(f"[precompute] caching ONLY hidden-state layers {keep_layers} "
+                             f"(training must pass --alignment_layer_indices {args.keep_layers})")
 
         # Iterate data and precompute
         bs = max(1, int(getattr(args, 'bsz', 1)))
@@ -296,6 +502,13 @@ def main():
                         'alignment_poss': alignment_poss,
                         'loss_type': [],
                     }
+                    if getattr(args, 'teacher_obs_mask', False):
+                        # Residual-objective teacher mask: obs rows blind to the
+                        # question image (see build_teacher_obs_mask docstring).
+                        m4d = build_teacher_obs_mask(
+                            batch['teacher_input_ids'], batch['teacher_attention_mask'],
+                            alignment_poss)
+                        inputs['attention_mask_4d'] = {"full_attention": m4d.to(device)}
                     if args.output_latent_embeds:
                         inputs['output_latent_embeds'] = True
                     if args.output_hidden_states:
@@ -322,7 +535,13 @@ def main():
                         elif args.sft_stage2_align_poss == 'latent_end':
                             metadata_str = f"rep_latent_end_{metadata_info}.pt"
                         save_path = os.path.join(out_dir, metadata_str)
-                        torch.save({'metadata_info': metadata_info, 'latent': teacher_reps[b].detach().cpu()}, save_path)
+                        rep = teacher_reps[b].detach()
+                        if keep_layers is not None and rep.dim() == 3:  # [num_layer, T, D]
+                            rep = rep[keep_layers]
+                        # fp16 halves cache size; cosine/margin losses are insensitive at this precision
+                        torch.save({'metadata_info': metadata_info,
+                                    'latent': rep.to(torch.float16).cpu(),
+                                    'keep_layers': keep_layers}, save_path)
                 except Exception as e:
                     logging.exception(f"[rank {rank}] Failed at batch start={i}, ids={cur_ids}: {e}")
                     # Continue processing other batches instead of crashing and hanging other ranks

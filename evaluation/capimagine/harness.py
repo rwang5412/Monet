@@ -45,26 +45,97 @@ MONET_FORMAT_SUFFIX = (
 )
 LATENT_START_ID = 151666
 
+# The paper's evaluation prompt, verbatim from arXiv:2511.21395v2 Appendix C
+# ("Detailed Experimental Setup"): the authors run VLMEvalKit with this exact
+# system message, max visual tokens 8192x28x28, and score with a rule-based judge
+# (exact match) FIRST, then DeepSeek-V3.1 / Gemini-2.5-Pro as SECONDARY judges.
+# This is the authoritative config that produced Monet-SFT V* = 82.20.
+# NOTE: the repo README (§Evaluation) gives a DIFFERENT prompt ("You are a helpful
+# multimodal assistant...") -- that is SYSTEM_PROMPT above. The two sources conflict;
+# Appendix C wins because it is the exact setup behind the reported numbers. The
+# boxed instruction is not in the paper's system prompt, so we append it inline in
+# the user turn, matching how the Monet-SFT-125K training questions are formatted.
+PAPER_EVAL_SYSTEM = (
+    "You are an expert multimodal large language model designed to reason with "
+    "latent visual embeddings."
+)
+PAPER_EVAL_BOXED = "\nPut your final answer within \\boxed{}."
+
+
+# Resolution, matched to the paper (max visual tokens 8192x28x28). We set these
+# PER-IMAGE in the message dict -- the path qwen-vl-utils/process_vision_info always
+# honors, exactly like VLMEvalKit's create_image_content. This is more reliable than
+# engine-level mm_processor_kwargs, which vLLM V1 can silently drop.
+MAX_PIXELS = 8192 * 28 * 28
+MIN_PIXELS = 256 * 28 * 28
+
+
+def _image_item(sample):
+    return {"type": "image", "image": sample.image,
+            "max_pixels": MAX_PIXELS, "min_pixels": MIN_PIXELS}
+
+
+def _vlmevalkit_user_text(sample):
+    """Byte-for-byte VLMEvalKit ImageMCQDataset.build_prompt (V* has no hint):
+        Question: {stem}\\nOptions:\\nA. {a}\\nB. {b}\\n...\\nPlease select the
+        correct answer from the options above. \\n
+    No boxed here -- VLMEvalKit carries the boxed instruction in the SYSTEM prompt.
+    The trailing 'above. \\n' (space + newline) matches VLMEvalKit exactly."""
+    opts = (sample.meta or {}).get("options") or {}
+    if not opts:
+        return f"Question: {sample.question}\n"
+    stem = (sample.meta or {}).get("stem") or sample.question
+    lines = "".join(f"{k}. {opts[k]}\n" for k in sorted(opts))
+    return (f"Question: {stem}\nOptions:\n{lines}"
+            "Please select the correct answer from the options above. \n")
+
 
 def _build_messages(samples, prompt_style="monet"):
+    if prompt_style == "vlmevalkit":
+        # Mirror the paper's VLMEvalKit path byte-for-byte: image FIRST, then the
+        # clean MCQ text (no boxed), per-image resolution, and the README system
+        # prompt -- which is the one the README pairs with VLMEvalKit and which
+        # carries the "Put your final answer in \boxed{}" instruction.
+        return [
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    _image_item(s),
+                    {"type": "text", "text": _vlmevalkit_user_text(s)},
+                ]},
+            ]
+            for s in samples
+        ]
+    if prompt_style == "paper_eval":
+        # Appendix C system prompt + the (cleaned) question with boxed appended inline.
+        return [
+            [
+                {"role": "system", "content": PAPER_EVAL_SYSTEM},
+                {"role": "user", "content": [
+                    {"type": "text", "text": s.question + PAPER_EVAL_BOXED},
+                    _image_item(s),
+                ]},
+            ]
+            for s in samples
+        ]
     if prompt_style == "monet":
         # In-distribution: default system prompt, training suffix inline in the user turn.
         return [
             [
                 {"role": "user", "content": [
                     {"type": "text", "text": s.question + MONET_FORMAT_SUFFIX},
-                    {"type": "image", "image": s.image},
+                    _image_item(s),
                 ]},
             ]
             for s in samples
         ]
-    # legacy: custom system role (off-distribution; kept only for comparison).
+    # legacy: the README's system prompt (kept for comparison).
     return [
         [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": [
                 {"type": "text", "text": s.question},
-                {"type": "image", "image": s.image},
+                _image_item(s),
             ]},
         ]
         for s in samples
@@ -101,9 +172,19 @@ def run(args):
         args.model, tp=args.tp, gpu_memory_utilization=args.gpu_mem,
         max_model_len=args.max_model_len)
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
-    sampling_params = SamplingParams(
-        temperature=0.0, max_tokens=args.max_tokens, n=1,
-        skip_special_tokens=False, seed=0)
+    # Greedy (temp=0) gives the cleanest do(Z) Delta -- clean vs corrupt differences
+    # are attributable to the latent, not sampling. But greedy can deterministically
+    # starve the "sometimes" latent token (see the smoke test); when emission needs
+    # sampling, use temp>0 with a fixed seed and mirror the canonical inference top_p/k.
+    if args.temperature > 0:
+        sampling_params = SamplingParams(
+            temperature=args.temperature, top_p=0.8, top_k=50,
+            max_tokens=args.max_tokens, n=1, skip_special_tokens=False, seed=0)
+    else:
+        sampling_params = SamplingParams(
+            temperature=0.0, max_tokens=args.max_tokens, n=1,
+            skip_special_tokens=False, seed=0)
+    print(f"[harness] prompt_style={args.prompt_style} temperature={args.temperature}")
 
     inputs = vllm_mllm_process_batch_from_messages(
         _build_messages(samples, args.prompt_style), processor)
@@ -195,9 +276,12 @@ def main():
     ap.add_argument("--dataset", required=True, choices=["vstar", "hrbench_4k"])
     ap.add_argument("--mode", required=True,
                     choices=["clean", "corrupt_gauss", "corrupt_mean"])
-    ap.add_argument("--prompt-style", default="monet", choices=["monet", "legacy"],
-                    help="monet = RL training prompt (default, in-distribution); "
-                         "legacy = old custom system prompt")
+    ap.add_argument("--prompt-style", default="monet",
+                    choices=["monet", "legacy", "paper_eval", "vlmevalkit"],
+                    help="vlmevalkit = mirror the paper's VLMEvalKit path (clean MCQ "
+                         "prompt + per-image resolution + expert system prompt); "
+                         "monet = RL training prompt; paper_eval = expert system prompt "
+                         "with the raw question; legacy = the README's prompt")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--stats", default=None,
                     help="mu/sigma stats path (default: <out-dir>/<dataset>_stats.pt)")
@@ -206,6 +290,9 @@ def main():
     ap.add_argument("--gpu-mem", type=float, default=0.85)
     ap.add_argument("--max-model-len", type=int, default=8192)
     ap.add_argument("--max-tokens", type=int, default=4096)
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="0 = greedy (cleanest do(Z) Delta); use 0.1 if greedy "
+                         "starves latent emission. top_p/top_k mirror inference when >0.")
     ap.add_argument("--latent-size", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()

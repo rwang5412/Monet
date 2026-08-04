@@ -63,12 +63,18 @@ class MonetLatentHook:
                            else os.getenv("MONET_LATENT_STATS"))
         self.seed = (seed if seed is not None
                      else int(os.getenv("MONET_LATENT_SEED", "0")))
+        # Optional: in capture mode, also save EVERY individual latent vector to this
+        # .pt (a [N, H] tensor) for collapse probes. Aggregate mu/sigma still go to
+        # stats_path; this keeps the raw vectors so we can measure cross-example
+        # variance / effective rank / pairwise cosine.
+        self.dump_path = os.getenv("MONET_LATENT_DUMP")
 
         # capture accumulators (float64 on CPU for numerical stability)
         self._count: int = 0
         self._sum: Optional[torch.Tensor] = None      # [H]
         self._sumsq: Optional[torch.Tensor] = None     # [H]
         self._since_dump: int = 0
+        self._dump = [] if self.dump_path else None    # list of [H] float32 CPU tensors
 
         # corruption tensors, lazily moved to the hidden state's device/dtype
         self._mu: Optional[torch.Tensor] = None        # [H]
@@ -108,10 +114,19 @@ class MonetLatentHook:
         torch.save({"mu": mu, "sigma": sigma, "count": self._count}, tmp)
         os.replace(tmp, self.stats_path)  # atomic
 
+    def _save_dump(self):
+        if not self.dump_path or not self._dump:
+            return
+        blob = torch.stack(self._dump)  # [N, H] float32
+        tmp = self.dump_path + ".tmp"
+        torch.save(blob, tmp)
+        os.replace(tmp, self.dump_path)  # atomic
+
     def finalize(self):
         """Flush the final capture stats. Safe to call more than once."""
         if self.mode == MODE_CAPTURE and self._count > 0:
             self._dump_stats()
+            self._save_dump()
             print(f"[MonetLatentHook] finalized capture: n={self._count} "
                   f"-> {self.stats_path}")
 
@@ -130,6 +145,10 @@ class MonetLatentHook:
             self._sumsq += h * h
             self._count += 1
             self._since_dump += 1
+            if self._dump is not None:
+                self._dump.append(hidden.detach().to(device="cpu", dtype=torch.float32))
+                if len(self._dump) % 100 == 0:  # persist periodically (worker has no finalize)
+                    self._save_dump()
             # Write on the very first latent (so a stats file always exists, even
             # on tiny smoke runs) and refresh every _DUMP_EVERY afterwards.
             if self._count == 1 or self._since_dump >= _DUMP_EVERY:

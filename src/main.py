@@ -127,6 +127,15 @@ model.config.answer_start_pattern = answer_start_pattern.tolist()
 for param in model.visual.parameters():
     param.requires_grad = False
 
+# Stage-2 Change 2: attach the latent-grounding InfoNCE module to the model so
+# its projector/queue live in the optimizer + checkpoints. Inert unless
+# --grounding_weight > 0.
+if args.stage == 'sft_stage2' and getattr(args, 'grounding_weight', 0.0) > 0:
+    from src.stage2_losses import LatentGroundingLoss
+    model.latent_grounding = LatentGroundingLoss(
+        d_model=config.text_config.hidden_size if hasattr(config, 'text_config') else config.hidden_size,
+        queue_size=args.grounding_queue_size, temp=args.grounding_temp)
+
 
 def collate_fn_sft_stage1(examples):
     # examples: list of {conversation: [...], sample_id: int}
@@ -329,6 +338,12 @@ for i, sample in tqdm(enumerate(all_train_dataset[:]), desc="Collecting training
     if processed is not None:
         train_dataset.append(processed)
 
+# Holdout support: cap the training set so the dataset TAIL stays unseen
+# (gate_stage2 evaluates on the last rows of the data file).
+if getattr(args, 'num_samples', -1) and args.num_samples > 0:
+    train_dataset = train_dataset[:args.num_samples]
+    logging.info(f"--num_samples: training on first {len(train_dataset)} processed rows; tail held out")
+
 #train_dataset = [d for d in [preprocess_function(sample) for sample in all_train_dataset[:]] if d is not None]
 
 
@@ -406,6 +421,11 @@ elif args.stage in ['sft_stage2','sft_stage3']:
     setattr(training_args, 'teacher_latent_dir', args.teacher_latent_dir)
     setattr(training_args, 'image_resize', args.image_resize)
     setattr(training_args, 'sft_stage2_align_poss', args.sft_stage2_align_poss)
+    # Stage-2 modifications (residual objective + latent grounding)
+    setattr(training_args, 'teacher_reps_neg_dir', args.teacher_reps_neg_dir)
+    setattr(training_args, 'obs_residual_margin', args.obs_residual_margin)
+    setattr(training_args, 'grounding_weight', args.grounding_weight)
+    setattr(training_args, 'alignment_layer_indices', args.alignment_layer_indices)
 
 # Initialize the trainer (callbacks that need trainer instance will be added after)
 trainer = CustomTrainer(
