@@ -63,6 +63,11 @@ mkdir -p "/scratch/$USER/logs" "$SAVE"
 # so we pin 12.3.0 unless CUDA_MODULE overrides.
 CUDA_MODULE="${CUDA_MODULE:-cuda/12.3.0}"
 module load "$CUDA_MODULE" 2>/dev/null || module load cuda 2>/dev/null || true
+# C++ compiler for JIT extensions (cpu_adam): no c++ on the default PATH at all
+# ('c++: command not found' -- the real cause of the cpu_adam build failures).
+GCC_MODULE="${GCC_MODULE:-gcc/12.3.0}"
+module load "$GCC_MODULE" 2>/dev/null || module load gcc 2>/dev/null || true
+command -v c++ >/dev/null 2>&1 || echo "WARNING: no c++ after module load; prebuilt cpu_adam.so required"
 command -v nvcc >/dev/null 2>&1 || { \
   echo "FATAL: nvcc not found (tried $CUDA_MODULE). Run 'module avail cuda' and resubmit with CUDA_MODULE=<name>."; exit 1; }
 export CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}"
