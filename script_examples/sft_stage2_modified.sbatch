@@ -70,6 +70,11 @@ echo "CUDA_HOME=$CUDA_HOME ($(nvcc --version | tail -1))"
 # Triton autotune cache off NFS (silences the DeepSpeed warning, avoids exit hangs)
 export TRITON_CACHE_DIR="/scratch/$USER/.triton_cache"
 mkdir -p "$TRITON_CACHE_DIR"
+# Torch JIT extensions (DeepSpeedCPUAdam) on scratch; PREBUILD once on the login
+# node (see repo notes) -- multi-rank JIT races on NFS home produce a broken
+# cpu_adam.so ('cannot open shared object file', jobs 14912695/6).
+export TORCH_EXTENSIONS_DIR="/scratch/$USER/torch_extensions"
+mkdir -p "$TORCH_EXTENSIONS_DIR"
 
 # Fail fast if the caches are missing (cheaper than dying mid-epoch).
 # NOTE: no `ls | head` here -- with 118K files head's early exit SIGPIPEs ls and
