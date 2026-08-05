@@ -90,7 +90,7 @@ torchrun --nproc-per-node="${NPROC:-8}" --master-port="${PORT:-29511}" -m src.ma
   --load_model_path "$STAGE1" \
   --save_model_path "$SAVE" \
   --dataset_root "$DATA" \
-  --deepspeed ./deepspeed/ds_zero2_gpu.json \
+  --deepspeed "${DS_CONFIG:-./deepspeed/ds_zero2_offload.json}" \
   --latent_size "$LATENT_SIZE" \
   --alignment_weight "$ALIGNMENT_WEIGHT" \
   --ce_emphasize_factor "$CE_EMPHASIZE_FACTOR" \
