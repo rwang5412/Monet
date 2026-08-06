@@ -80,6 +80,11 @@ mkdir -p "$TRITON_CACHE_DIR"
 # cpu_adam.so ('cannot open shared object file', jobs 14912695/6).
 export TORCH_EXTENSIONS_DIR="/scratch/$USER/torch_extensions"
 mkdir -p "$TORCH_EXTENSIONS_DIR"
+# Plan B default: no-JIT offload (torch AdamW does the CPU step). cpu_adam JIT is
+# unbuildable on the H100 nodes (gcc 12.3 emits AVX512-FP16 the system assembler
+# doesn't know: 'no such instruction: vmovw'). Client optimizer must be the
+# non-fused torch AdamW since its states live on CPU.
+export MONET_OPTIM="${MONET_OPTIM:-adamw_torch}"
 
 # Fail fast if the caches are missing (cheaper than dying mid-epoch).
 # NOTE: no `ls | head` here -- with 118K files head's early exit SIGPIPEs ls and
@@ -100,7 +105,7 @@ torchrun --nproc-per-node="${NPROC:-8}" --master-port="${PORT:-29511}" -m src.ma
   --load_model_path "$STAGE1" \
   --save_model_path "$SAVE" \
   --dataset_root "$DATA" \
-  --deepspeed "${DS_CONFIG:-./deepspeed/ds_zero2_offload.json}" \
+  --deepspeed "${DS_CONFIG:-./deepspeed/ds_zero2_offload_nojit.json}" \
   --latent_size "$LATENT_SIZE" \
   --alignment_weight "$ALIGNMENT_WEIGHT" \
   --ce_emphasize_factor "$CE_EMPHASIZE_FACTOR" \
