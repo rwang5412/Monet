@@ -4,8 +4,11 @@
 #SBATCH --error=/scratch/%u/logs/sft2_mod_%j.err
 #SBATCH --gpus-per-node=a100:8
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=320G
+#SBATCH --mem=0
 #SBATCH --time=72:00:00
+# --mem=0 = all RAM on the (exclusive) node. Job 14946762 host-OOM'd at ~step
+# 190 under --mem=320G: 32 pinned dataloader workers + DeepSpeed pinned CPU
+# offload. See MONET_NUM_WORKERS / MONET_PIN_MEMORY below.
 #
 # Modified SFT Stage 2 on the ORIGINAL Monet stage-1 warm-up checkpoint.
 # Two changes vs the paper's stage 2 (both default-ON here):
@@ -86,6 +89,11 @@ mkdir -p "$TORCH_EXTENSIONS_DIR"
 # non-fused torch AdamW since its states live on CPU.
 export MONET_OPTIM="${MONET_OPTIM:-adamw_torch}"
 
+# Host-RAM controls (job 14946762 OOM). Fewer, unpinned dataloader workers cut
+# the pinned-memory footprint that stacked on DeepSpeed's CPU-offload buffers.
+export MONET_NUM_WORKERS="${MONET_NUM_WORKERS:-2}"
+export MONET_PIN_MEMORY="${MONET_PIN_MEMORY:-0}"
+
 # Fail fast if the caches are missing (cheaper than dying mid-epoch).
 # NOTE: no `ls | head` here -- with 118K files head's early exit SIGPIPEs ls and
 # pipefail kills the job (exit 141). find -quit stops after the first match.
@@ -119,6 +127,8 @@ torchrun --nproc-per-node="${NPROC:-8}" --master-port="${PORT:-29511}" -m src.ma
   --grounding_weight "$GROUNDING_WEIGHT" \
   --grounding_queue_size "$GROUNDING_QUEUE" \
   --observation_tokens_cannot_see_question_image \
+  --save_freq "${SAVE_FREQ:-150}" \
+  ${RESUME:+--resume_from_checkpoint} \
   ${WANDB_NAME:+--wandb_name "$WANDB_NAME"}
 
 echo "Modified stage-2 done -> $SAVE"
