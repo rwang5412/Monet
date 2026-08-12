@@ -4,11 +4,12 @@
 #SBATCH --error=/scratch/%u/logs/sft2_mod_%j.err
 #SBATCH --gpus-per-node=a100:8
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=0
+#SBATCH --mem=750G
 #SBATCH --time=72:00:00
-# --mem=0 = all RAM on the (exclusive) node. Job 14946762 host-OOM'd at ~step
-# 190 under --mem=320G: 32 pinned dataloader workers + DeepSpeed pinned CPU
-# offload. See MONET_NUM_WORKERS / MONET_PIN_MEMORY below.
+# Palmetto 2 forbids --mem=0; request an explicit high value. Job 14946762
+# host-OOM'd at ~step 190 under --mem=320G (32 pinned dataloader workers +
+# DeepSpeed pinned CPU offload). 750G is ~2.3x that; raise via CLI --mem if the
+# node has more (sinfo -o "%n %m" -N). See MONET_NUM_WORKERS / MONET_PIN_MEMORY.
 #
 # Modified SFT Stage 2 on the ORIGINAL Monet stage-1 warm-up checkpoint.
 # Two changes vs the paper's stage 2 (both default-ON here):
