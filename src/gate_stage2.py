@@ -143,35 +143,61 @@ def main():
     pw = (sv ** 2) / (sv ** 2).sum()
     eff_rank = float(torch.exp(-(pw * (pw + 1e-12).log()).sum()))
 
-    # intervention gap: obs-token accuracy with real vs shuffled (donor) latents
-    acc_real, acc_shuf = [], []
+    # intervention: obs-token NLL + accuracy under THREE latent conditions.
+    #   real  -- the sample's own latents
+    #   donor -- another sample's latents (CONTENT swap; tests content-causality)
+    #   zero  -- ablated latents (PRESENCE swap; tests presence-causality)
+    # argmax accuracy under teacher-forcing saturates (content can move
+    # probability mass without flipping an argmax), so NLL is the sensitive read.
+    # The zero condition separates "latents unused" from "present but content-inert".
+    #   nll(donor) - nll(real) > 0  => the LM READS sample-specific content
+    #   nll(zero)  - nll(real) > 0  => the LM uses the latents' presence at all
+    def obs_nll_acc(ce_in, obs_poss, pos_list, zz):
+        out = student(**ce_in, ce_patch_pos=[pos_list], ce_patch_vec=[zz],
+                      loss_type=['ce'], return_dict=True)
+        lg = out.logits[0].float()                              # [S, V]
+        poss = torch.tensor(obs_poss, device=lg.device, dtype=torch.long)
+        lab = ce_in['labels'][0][poss]                          # target token at poss
+        valid = lab != -100
+        if int(valid.sum()) == 0:
+            return None, None
+        pred = lg[poss - 1][valid]                              # logits[poss-1] predicts poss
+        tgt = lab[valid]
+        logp = F.log_softmax(pred, dim=-1)
+        nll = float(-logp[torch.arange(tgt.numel(), device=lg.device), tgt].mean())
+        acc = float((pred.argmax(-1) == tgt).float().mean())
+        return nll, acc
+
+    nll_r, nll_d, nll_z, acc_r, acc_d, acc_z = ([] for _ in range(6))
     with torch.inference_mode():
         for j, (inp, z, pos_list) in enumerate(real_pack):
             donor = real_pack[(j + 1) % len(real_pack)][1]
             if donor.shape != z.shape:
                 continue
             ce_in, obs_poss = obs_token_acc_inputs(inp, processor, device=dev)
-            for zz, sink in ((z, acc_real), (donor, acc_shuf)):
-                out = student(**ce_in, ce_patch_pos=[pos_list], ce_patch_vec=[zz],
-                              loss_type=['ce'], compute_emphasize_acc=True,
-                              ce_emphasize_poss=[obs_poss], ce_emphasize_factor=1.0,
-                              return_dict=True)
-                if out.mean_emphasize_acc is not None:
-                    sink.append(float(out.mean_emphasize_acc))
+            zero = torch.zeros_like(z)
+            for zz, ns, as_ in ((z, nll_r, acc_r), (donor, nll_d, acc_d), (zero, nll_z, acc_z)):
+                nll, acc = obs_nll_acc(ce_in, obs_poss, pos_list, zz)
+                if nll is not None:
+                    ns.append(nll); as_.append(acc)
 
-    ar = sum(acc_real) / max(len(acc_real), 1)
-    asf = sum(acc_shuf) / max(len(acc_shuf), 1)
+    mean = lambda xs: sum(xs) / max(len(xs), 1)
+    ar, ad, az = mean(acc_r), mean(acc_d), mean(acc_z)
+    nr, nd, nz = mean(nll_r), mean(nll_d), mean(nll_z)
     report = {
         "n_scored": n,
         "cross_sample_sim": cross,
         "effective_rank": eff_rank,
         "within_block_sim": sum(within) / max(len(within), 1),
         "s_pos_minus_s_neg": sum(s_gap) / max(len(s_gap), 1),
-        "obs_acc_real": ar, "obs_acc_shuffled": asf,
-        "intervention_gap": ar - asf,
+        "obs_acc_real": ar, "obs_acc_donor": ad, "obs_acc_zero": az,
+        "obs_nll_real": nr, "obs_nll_donor": nd, "obs_nll_zero": nz,
+        "intervention_gap_acc": ar - ad,
+        "content_nll_gap": nd - nr,     # donor - real: content-causality
+        "presence_nll_gap": nz - nr,    # zero  - real: presence-causality
     }
     json.dump(report, open(args.out, "w"), indent=2)
-    W = 62
+    W = 66
     print("=" * W)
     print("  Stage-2 promotion gate")
     print("=" * W)
@@ -179,9 +205,13 @@ def main():
     print(f"  effective rank          = {eff_rank:.1f}   (released Monet ~3; want >> 10)")
     print(f"  within-block latent sim = {report['within_block_sim']:.4f}")
     print(f"  s_pos - s_neg (student) = {report['s_pos_minus_s_neg']:+.4f}   (want > 0; ~0 => mask leak)")
-    print(f"  obs acc real / shuffled = {ar:.4f} / {asf:.4f}")
-    print(f"  intervention gap        = {ar - asf:+.4f}   (want > 0)")
-    ok = cross < 0.9 and (ar - asf) > 0
+    print(f"  obs acc  real/donor/zero= {ar:.4f} / {ad:.4f} / {az:.4f}")
+    print(f"  obs NLL  real/donor/zero= {nr:.4f} / {nd:.4f} / {nz:.4f}")
+    print(f"  content  NLL gap (d-r)  = {nd - nr:+.4f}   (want > 0: LM reads content)")
+    print(f"  presence NLL gap (z-r)  = {nz - nr:+.4f}   (want > 0: LM uses presence)")
+    # Promotion requires a MEANINGFUL content effect, not just sign. A ~0.02-nat
+    # floor keeps a rounding-artifact gap (the old +0.0001) from printing PASS.
+    ok = cross < 0.9 and eff_rank > 10 and (nd - nr) > 0.02
     print(f"  GATE: {'PASS — latents may become Stage-3 targets' if ok else 'FAIL — do NOT promote to Stage 3'}")
     print("=" * W)
 
