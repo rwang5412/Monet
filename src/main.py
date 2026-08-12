@@ -400,8 +400,12 @@ training_args = SFTConfig(
     # DDP related
     ddp_backend="nccl" if is_parallel else None,
     ddp_find_unused_parameters=False if is_parallel else None,
-    dataloader_num_workers=4 if is_parallel else 0,
-    dataloader_pin_memory=True,
+    # Host-RAM guard: 4 workers x 8 ranks = 32 prefetching processes, and with
+    # pin_memory those buffers are unswappable and stack on top of DeepSpeed's
+    # pinned CPU-offload states -> host OOM on the 118K run. Env-tunable; the
+    # sbatch drops this to 2 and pinning off for the full run.
+    dataloader_num_workers=(int(os.environ.get("MONET_NUM_WORKERS", "4")) if is_parallel else 0),
+    dataloader_pin_memory=(os.environ.get("MONET_PIN_MEMORY", "1") == "1"),
     # Save only on global rank 0 when running multi-node
     save_on_each_node=False,
     # DeepSpeed config (if provided via --deepspeed)
