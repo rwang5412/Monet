@@ -130,6 +130,14 @@ def main():
     n = C.shape[0]
     cross = float((C.sum() - n) / (n * (n - 1)))
 
+    # collapse probe: effective rank of the full latent cloud (all slots x samples).
+    # exp(entropy of normalized squared singular values); released Monet ~3.
+    allz = torch.cat([p[1].float().cpu() for p in real_pack], dim=0)
+    allz = allz - allz.mean(0, keepdim=True)
+    sv = torch.linalg.svdvals(allz)
+    pw = (sv ** 2) / (sv ** 2).sum()
+    eff_rank = float(torch.exp(-(pw * (pw + 1e-12).log()).sum()))
+
     # intervention gap: obs-token accuracy with real vs shuffled (donor) latents
     acc_real, acc_shuf = [], []
     with torch.inference_mode():
@@ -151,6 +159,7 @@ def main():
     report = {
         "n_scored": n,
         "cross_sample_sim": cross,
+        "effective_rank": eff_rank,
         "within_block_sim": sum(within) / max(len(within), 1),
         "s_pos_minus_s_neg": sum(s_gap) / max(len(s_gap), 1),
         "obs_acc_real": ar, "obs_acc_shuffled": asf,
@@ -162,6 +171,7 @@ def main():
     print("  Stage-2 promotion gate")
     print("=" * W)
     print(f"  cross-sample latent sim = {cross:.4f}   (baseline 0.96; want < 0.7)")
+    print(f"  effective rank          = {eff_rank:.1f}   (released Monet ~3; want >> 10)")
     print(f"  within-block latent sim = {report['within_block_sim']:.4f}")
     print(f"  s_pos - s_neg (student) = {report['s_pos_minus_s_neg']:+.4f}   (want > 0; ~0 => mask leak)")
     print(f"  obs acc real / shuffled = {ar:.4f} / {asf:.4f}")

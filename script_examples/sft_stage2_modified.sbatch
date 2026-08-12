@@ -63,6 +63,11 @@ mkdir -p "/scratch/$USER/logs" "$SAVE"
 # so we pin 12.3.0 unless CUDA_MODULE overrides.
 CUDA_MODULE="${CUDA_MODULE:-cuda/12.3.0}"
 module load "$CUDA_MODULE" 2>/dev/null || module load cuda 2>/dev/null || true
+# C++ compiler for JIT extensions (cpu_adam): no c++ on the default PATH at all
+# ('c++: command not found' -- the real cause of the cpu_adam build failures).
+GCC_MODULE="${GCC_MODULE:-gcc/12.3.0}"
+module load "$GCC_MODULE" 2>/dev/null || module load gcc 2>/dev/null || true
+command -v c++ >/dev/null 2>&1 || echo "WARNING: no c++ after module load; prebuilt cpu_adam.so required"
 command -v nvcc >/dev/null 2>&1 || { \
   echo "FATAL: nvcc not found (tried $CUDA_MODULE). Run 'module avail cuda' and resubmit with CUDA_MODULE=<name>."; exit 1; }
 export CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}"
@@ -70,6 +75,16 @@ echo "CUDA_HOME=$CUDA_HOME ($(nvcc --version | tail -1))"
 # Triton autotune cache off NFS (silences the DeepSpeed warning, avoids exit hangs)
 export TRITON_CACHE_DIR="/scratch/$USER/.triton_cache"
 mkdir -p "$TRITON_CACHE_DIR"
+# Torch JIT extensions (DeepSpeedCPUAdam) on scratch; PREBUILD once on the login
+# node (see repo notes) -- multi-rank JIT races on NFS home produce a broken
+# cpu_adam.so ('cannot open shared object file', jobs 14912695/6).
+export TORCH_EXTENSIONS_DIR="/scratch/$USER/torch_extensions"
+mkdir -p "$TORCH_EXTENSIONS_DIR"
+# Plan B default: no-JIT offload (torch AdamW does the CPU step). cpu_adam JIT is
+# unbuildable on the H100 nodes (gcc 12.3 emits AVX512-FP16 the system assembler
+# doesn't know: 'no such instruction: vmovw'). Client optimizer must be the
+# non-fused torch AdamW since its states live on CPU.
+export MONET_OPTIM="${MONET_OPTIM:-adamw_torch}"
 
 # Fail fast if the caches are missing (cheaper than dying mid-epoch).
 # NOTE: no `ls | head` here -- with 118K files head's early exit SIGPIPEs ls and
@@ -90,7 +105,7 @@ torchrun --nproc-per-node="${NPROC:-8}" --master-port="${PORT:-29511}" -m src.ma
   --load_model_path "$STAGE1" \
   --save_model_path "$SAVE" \
   --dataset_root "$DATA" \
-  --deepspeed ./deepspeed/ds_zero2_gpu.json \
+  --deepspeed "${DS_CONFIG:-./deepspeed/ds_zero2_offload_nojit.json}" \
   --latent_size "$LATENT_SIZE" \
   --alignment_weight "$ALIGNMENT_WEIGHT" \
   --ce_emphasize_factor "$CE_EMPHASIZE_FACTOR" \

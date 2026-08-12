@@ -383,7 +383,9 @@ training_args = SFTConfig(
     save_strategy="steps",
     save_steps=args.save_freq,
     save_total_limit=10,
-    optim="adamw_torch_fused",
+    # MONET_OPTIM=adamw_torch when the optimizer states are CPU-offloaded with a
+    # client (non-DeepSpeed) optimizer -- the fused variant targets CUDA tensors.
+    optim=os.environ.get("MONET_OPTIM", "adamw_torch_fused"),
     bf16=True,
     push_to_hub=False,
     remove_unused_columns=False,

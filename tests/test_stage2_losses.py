@@ -120,3 +120,16 @@ def test_grounding_none_aux_gives_zero():
     m = _mk()
     loss = m([torch.randn(K, D)], [None], enqueue=True)
     assert float(loss) == 0.0 and int(m.filled) == 0
+
+
+def test_grounding_backward_after_enqueue():
+    """Regression: HF runs backward AFTER compute_loss, i.e. after _enqueue has
+    mutated the queue buffer in place. Without the .clone() on the negatives
+    matmul this raises 'modified by an inplace operation' (killed jobs
+    14906125/14906402)."""
+    m = _mk()
+    lat = [torch.randn(K, D, requires_grad=True)]
+    aux = [torch.randn(7, D)]
+    loss = m(lat, aux, enqueue=True)   # enqueue mutates the queue...
+    loss.backward()                     # ...then backward must still succeed
+    assert lat[0].grad is not None

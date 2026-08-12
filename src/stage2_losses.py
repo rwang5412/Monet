@@ -65,11 +65,17 @@ class LatentGroundingLoss(nn.Module):
             dev = self.queue.device
             return torch.zeros((), device=dev)
 
-        z = F.normalize(self.proj(torch.stack(zs).float()), dim=-1)        # (B, D)
-        v = F.normalize(torch.stack(vs).to(z.device), dim=-1).detach()     # (B, D)
+        # Run the projector in ITS dtype (DeepSpeed bf16 casts the module), then
+        # do the similarity math in fp32 for stability.
+        w_dtype = self.proj[0].weight.dtype
+        z = F.normalize(self.proj(torch.stack(zs).to(w_dtype)).float(), dim=-1)   # (B, D)
+        v = F.normalize(torch.stack(vs).float().to(z.device), dim=-1).detach()    # (B, D)
 
         pos = (z * v).sum(-1, keepdim=True)                                # (B, 1)
-        neg = z @ self.queue[: max(int(self.filled), 1)].to(z.device).T    # (B, Q_filled)
+        # .clone() is load-bearing: the matmul saves its input for backward, and
+        # _enqueue() mutates the queue buffer IN PLACE before HF runs backward
+        # -> "modified by an inplace operation" crash without it (MoCo pattern).
+        neg = z @ self.queue[: max(int(self.filled), 1)].to(z.device, z.dtype).clone().T  # (B, Q_filled)
         logits = torch.cat([pos, neg], dim=1) / self.temp
         loss = F.cross_entropy(
             logits, torch.zeros(z.shape[0], dtype=torch.long, device=z.device))

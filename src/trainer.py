@@ -294,18 +294,49 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
 
         # Latent-routed auxiliary total (alignment/residual + grounding), then the
         # latent-only backprop surrogate: stop_grad(dL/d_latent)^T . latent.
+        #
+        # DeepSpeed compat: newer DeepSpeed arms a post-backward epilogue that
+        # fires on ANY backward -- the surrogate's inner torch.autograd.grad
+        # (activation-only, no param grads) then crashes ZeRO-2's reducer
+        # (IndexError on empty buckets). On first failure we permanently fall
+        # back to DIRECT backprop of the aux losses. This is safe in OUR setup
+        # (unlike original Monet's 46% ablation): the attention masks make the
+        # latents the ONLY information route into the obs positions, so the
+        # shortcut the surrogate guarded against is closed architecturally.
         latent_routed = self.args.alignment_weight * alignment_loss
         if grounding_writer is not None:
             latent_routed = latent_routed + self.grounding_weight * grounding_writer
         has_latent_routed = (isinstance(latent_routed, torch.Tensor) and latent_routed.requires_grad
                              and float(latent_routed.detach()) != 0.0)
-        if self.args.emphasize_latent_weight != 0.0 and has_latent_routed: # latent-only backpropagation
-            latent_only_loss = compute_latents_only_loss(outputs.ce_patch_vec, latent_routed)
-            loss = self.args.emphasize_latent_weight * latent_only_loss + teacher_ce_loss
-        else:
+        if not hasattr(self, '_latent_only_mode'):
+            forced = os.environ.get('MONET_LATENT_ONLY_MODE')
+            if forced in ('surrogate', 'direct'):
+                self._latent_only_mode = forced
+            else:
+                # deterministic choice: under DeepSpeed the surrogate's inner
+                # autograd.grad crashes the ZeRO reducer, so default to direct.
+                self._latent_only_mode = ('direct' if getattr(self, 'is_deepspeed_enabled', False)
+                                          else 'surrogate')
+            logging.warning(f"latent-only BP mode: {self._latent_only_mode} "
+                            f"(masks preserve latent-only information flow in direct mode)")
+        if (self.args.emphasize_latent_weight != 0.0 and has_latent_routed
+                and self._latent_only_mode == 'surrogate'):
+            try:
+                latent_only_loss = compute_latents_only_loss(outputs.ce_patch_vec, latent_routed)
+                loss = self.args.emphasize_latent_weight * latent_only_loss + teacher_ce_loss
+                if grounding_writer is not None:
+                    loss = loss + self.grounding_weight * grounding_proj  # projector path (latents detached)
+            except (IndexError, RuntimeError) as e:
+                logging.warning(
+                    f"latent-only surrogate incompatible with this DeepSpeed ({e!r}); "
+                    f"switching PERMANENTLY to direct backprop of the aux losses. "
+                    f"Latent-only information flow is preserved by the attention masks.")
+                self._latent_only_mode = 'direct'
+        if self._latent_only_mode == 'direct' or not (self.args.emphasize_latent_weight != 0.0 and has_latent_routed):
+            # direct mode: one backprop through everything; grounding_writer's
+            # graph already includes the projector, so grounding_proj is NOT
+            # added (it would double-count the projector gradient).
             loss = teacher_ce_loss + latent_routed
-        if grounding_writer is not None:
-            loss = loss + self.grounding_weight * grounding_proj  # projector-only path (latents detached)
 
         if getattr(teacher_output, 'mean_emphasize_acc', None) is not None:
             self.observation_token_acc += getattr(teacher_output, 'mean_emphasize_acc')
