@@ -113,7 +113,12 @@ def main():
                 out = student(**ce_in, ce_patch_pos=[pos_list], ce_patch_vec=[z],
                               loss_type=[], output_hidden_states=True,
                               alignment_poss=[obs_poss], return_dict=True)
-                hs = torch.stack(out.hidden_states, dim=0)[:, 0, obs_poss, :]
+                # alignment_poss makes the model return hidden_states[0] already
+                # packed as [num_layer, T_obs, D] (same format the teacher pass
+                # consumes) -- do NOT re-stack/re-gather obs_poss here: those are
+                # full-sequence indices and would index out of bounds into the
+                # already-reduced obs dimension (device-side assert).
+                hs = out.hidden_states[0]
                 if layer_idx is not None:
                     hs = hs[layer_idx]
                 hp = t_pos[i].to(dev, hs.dtype)
