@@ -433,7 +433,15 @@ class CustomTrainerSFT_STAGE3(SFTTrainer):
         inputs['loss_type'] = []
         inputs['output_hidden_states'] = False
         student_outputs_latent = model(**inputs)
-        
+        # Stash the generated latents (in-graph, grad flows to the params that
+        # produced them) so a subclass can add a writer loss (L_dec) on them
+        # before backward. bsz=1 -> single [K, d] tensor.
+        try:
+            cpv = student_outputs_latent.ce_patch_vec
+            self._last_latents = cpv[0] if isinstance(cpv, (list, tuple)) else cpv
+        except Exception:
+            self._last_latents = None
+
 
         # Student CE forward
         inputs['latent_mode'] = False
