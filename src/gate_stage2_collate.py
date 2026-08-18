@@ -85,6 +85,48 @@ def _teacher_obs_mask(input_ids, pad_mask, obs_poss, ids):
     return allowed.unsqueeze(1)  # [1,1,L,L]
 
 
+def qtext_masked_4d(student_inp: dict, obs_poss, ans_poss, processor):
+    """Discriminator mask: block the observation+answer rows from attending to the
+    question-TEXT columns (everything before <|im_start|>assistant that is NOT a
+    question-image span and not padding -- i.e. system + user text).
+
+    Returns a NEW attention_mask_4d dict (the base student mask, already blocking
+    the question IMAGE, further blocked from question TEXT). Rows keep access to
+    the latents, their own prefix, and themselves, so no row is fully masked.
+    Used to test: does obs/answer content come from the question text? If NLL
+    barely rises under this mask, text was not the content source.
+    """
+    ids = _ids(processor)
+    base = student_inp["attention_mask_4d"]["full_attention"]   # [1,1,L,L] bool, on device
+    m = base.clone()
+    dev = m.device
+    row = student_inp["input_ids"][0].to(dev)
+    L = row.numel()
+    pat = ids["ans_start"].to(dev)
+    k = int(pat.numel())
+    ans_start = -1
+    for s in range(0, L - k + 1):
+        if torch.equal(row[s:s + k], pat):
+            ans_start = s
+            break
+    if ans_start <= 0:
+        return {"full_attention": m}   # can't locate assistant turn; no-op
+    # question-image columns to EXCLUDE from the text set
+    v_s = torch.nonzero(row == ids["v_start"].item(), as_tuple=False).flatten().tolist()
+    v_e = torch.nonzero(row == ids["v_end"].item(), as_tuple=False).flatten().tolist()
+    img_cols = set()
+    for a, b in zip(v_s, v_e):
+        if b < ans_start:
+            img_cols.update(range(a, b + 1))
+    qtext_cols = [p for p in range(ans_start) if p not in img_cols]
+    block_rows = sorted(set(list(obs_poss) + list(ans_poss)))
+    if qtext_cols and block_rows:
+        r = torch.tensor(block_rows, dtype=torch.long, device=dev)
+        c = torch.tensor(qtext_cols, dtype=torch.long, device=dev)
+        m[0, 0][r.unsqueeze(1), c] = False
+    return {"full_attention": m}
+
+
 def build_teacher_batches(row, processor, root, no_aux: bool, device) -> Tuple[dict, list]:
     ids = _ids(processor)
     example = _absolutize(row, root)

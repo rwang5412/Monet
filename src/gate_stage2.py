@@ -48,7 +48,8 @@ def main():
     import monet_qwen_model.apply_qwen2_5_monet  # noqa: F401 (sys.modules patch)
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
     from src.gate_stage2_collate import (build_student_stage2_batch,
-                                         build_teacher_batches, obs_token_acc_inputs)
+                                         build_teacher_batches, obs_token_acc_inputs,
+                                         qtext_masked_4d)
 
     layer_idx = ([int(x) for x in args.alignment_layer_indices.split(',')]
                  if args.alignment_layer_indices else None)
@@ -172,15 +173,17 @@ def main():
     # ANSWER tokens (labeled response tokens that are NOT observations -- reasoning
     # + final answer). do(Z) is answer-level, so obs-causality can be won while the
     # answer stays latent-independent -- we must see both.
-    def run_cond(ce_in, obs_poss, ans_poss, pos_list, zz):
-        out = student(**ce_in, ce_patch_pos=[pos_list], ce_patch_vec=[zz],
+    def run_cond(ce_in, obs_poss, ans_poss, pos_list, zz, mask4d=None):
+        cin = ce_in if mask4d is None else {**ce_in, 'attention_mask_4d': mask4d}
+        out = student(**cin, ce_patch_pos=[pos_list], ce_patch_vec=[zz],
                       loss_type=['ce'], return_dict=True)
         lg = out.logits[0].float()
-        lab = ce_in['labels'][0]
+        lab = cin['labels'][0]
         return _gather(lg, lab, obs_poss), _gather(lg, lab, ans_poss)
 
     o_nr, o_nd, o_nz, o_ar, o_ad, o_az = ([] for _ in range(6))   # obs NLL/acc
     a_nr, a_nd, a_nz, a_ar, a_ad, a_az = ([] for _ in range(6))   # answer NLL/acc
+    o_nt, a_nt = [], []   # obs/answer NLL under REAL latents + question-TEXT masked
     with torch.inference_mode():
         for j, (inp, z, pos_list) in enumerate(real_pack):
             donor = real_pack[(j + 1) % len(real_pack)][1]
@@ -199,11 +202,25 @@ def main():
                     on.append(onll); oa.append(oacc)
                 if anll is not None:
                     an_.append(anll); aa.append(aacc)
+            # DISCRIMINATOR: real latents, question-TEXT attention-masked.
+            # text-masked ~= text-visible (o_nr) => content NOT in text (Reading 1);
+            # text-masked >> text-visible => content in text (Reading 2).
+            try:
+                tm = qtext_masked_4d(inp, obs_poss, ans_poss, processor)
+                (otll, _), (atll, _) = run_cond(ce_in, obs_poss, ans_poss, pos_list, z, mask4d=tm)
+                if otll is not None:
+                    o_nt.append(otll)
+                if atll is not None:
+                    a_nt.append(atll)
+            except Exception as e:
+                if j < 3:
+                    print(f"[gate] qtext-mask skip {j}: {e!r}")
 
     mean = lambda xs: sum(xs) / max(len(xs), 1)
     ar, ad, az = mean(o_ar), mean(o_ad), mean(o_az)
     nr, nd, nz = mean(o_nr), mean(o_nd), mean(o_nz)
     ban_r, ban_d, ban_z = mean(a_nr), mean(a_nd), mean(a_nz)   # answer NLLs
+    o_ntm, a_ntm = mean(o_nt), mean(a_nt)                      # text-masked NLLs
     report = {
         "n_scored": n,
         "cross_sample_sim": cross,
@@ -213,11 +230,16 @@ def main():
         "obs_acc_real": ar, "obs_acc_donor": ad, "obs_acc_zero": az,
         "obs_nll_real": nr, "obs_nll_donor": nd, "obs_nll_zero": nz,
         "ans_nll_real": ban_r, "ans_nll_donor": ban_d, "ans_nll_zero": ban_z,
+        "obs_nll_textmasked": o_ntm, "ans_nll_textmasked": a_ntm,
         "intervention_gap_acc": ar - ad,
         "content_nll_gap": nd - nr,          # obs: donor - real (content-causality)
         "presence_nll_gap": nz - nr,         # obs: zero  - real (presence-causality)
         "ans_content_nll_gap": ban_d - ban_r,  # ANSWER content-causality (do(Z) proxy)
         "ans_presence_nll_gap": ban_z - ban_r,
+        # DISCRIMINATOR: text-masked minus real. Large => content lives in question
+        # text (Reading 2, Option C works). ~0 => content not in text (Reading 1).
+        "obs_textmask_gap": o_ntm - nr,
+        "ans_textmask_gap": a_ntm - ban_r,
     }
     json.dump(report, open(args.out, "w"), indent=2)
     W = 66
@@ -235,6 +257,11 @@ def main():
     print(f"  OBS presence NLL gap(z-r)= {nz - nr:+.4f}  (want > 0: LM uses presence)")
     print(f"  ANS content NLL gap(d-r)= {ban_d - ban_r:+.4f}   (the do(Z) proxy: answer reads content)")
     print(f"  ANS presence NLL gap(z-r)= {ban_z - ban_r:+.4f}")
+    print("  --- discriminator: real latents, question-TEXT attention-masked ---")
+    print(f"  obs NLL real/textmasked = {nr:.4f} / {o_ntm:.4f}")
+    print(f"  ans NLL real/textmasked = {ban_r:.4f} / {a_ntm:.4f}")
+    print(f"  OBS textmask gap        = {o_ntm - nr:+.4f}   (>>0 => content in text [C works]; ~0 => not [need reader loss])")
+    print(f"  ANS textmask gap        = {a_ntm - ban_r:+.4f}")
     # Promotion requires a MEANINGFUL content effect, not just sign. A ~0.02-nat
     # floor keeps a rounding-artifact gap (the old +0.0001) from printing PASS.
     ok = cross < 0.9 and eff_rank > 10 and (nd - nr) > 0.02
