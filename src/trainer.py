@@ -417,6 +417,21 @@ class CustomTrainerSFT_STAGE3(SFTTrainer):
         # Load precomputed teacher latents
         teacher_latents = load_offline_tensor(self.teacher_latent_dir, batch_metadata=inputs['metadata'], alignment_layer=self.args.alignment_layer, rep_type="latent")
 
+        # Recentered alignment (mod A): subtract the dataset-mean target latent so
+        # the cosine budget goes to the content subspace, not the shared mean.
+        # _align_mean ([L,d] or [d]) is set by the decode subclass; None => stock.
+        _am = getattr(self, '_align_mean', None)
+        if _am is not None and teacher_latents is not None:
+            rc = []
+            for t in teacher_latents:
+                m = _am.to(t.device, t.dtype)
+                if t.dim() == 3 and m.dim() == 2:      # [L,K,d] - [L,1,d]
+                    m = m.unsqueeze(1)
+                elif t.dim() == 2 and m.dim() == 2:    # [K,d] - [d]
+                    m = m.mean(0)
+                rc.append(t - m)
+            teacher_latents = rc
+
         # ------------------------------------------------------------------
         # Latent forward to get ce_patch_pos (positions of latent embeddings) and ce_patch_vec (latent embeddings)
         # ------------------------------------------------------------------

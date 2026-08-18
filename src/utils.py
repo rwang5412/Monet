@@ -66,6 +66,10 @@ def get_args():
     parser.add_argument("--slot_dropout", type=int, default=2,
                         help="L_dec: hide this many of K slots from the decoder's cross-attention "
                              "each step so no single slot is the sole carrier (breaks within-block 0.92).")
+    parser.add_argument("--align_recenter_path", type=str, default=None,
+                        help="Stage-3 recentered alignment (mod A): path to align_mean.pt "
+                             "(from src.compute_target_mean). Subtracts the dataset-mean target "
+                             "before the cosine so alignment targets the content subspace. None = off.")
     # Stage-3 modification: random-donor margin swap (reader-side, accuracy-preserving).
     parser.add_argument("--swap_weight", type=float, default=0.0,
                         help="lambda for L_swap (Stage-3): a random donor's latents must make "

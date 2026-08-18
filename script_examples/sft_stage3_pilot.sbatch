@@ -56,6 +56,17 @@ first=$(find "$TARGETS" -maxdepth 1 -name '*.pt' -print -quit 2>/dev/null)
 [ -z "$first" ] && { echo "FATAL: no target latents in $TARGETS (run harvest_stage3_targets first)"; exit 1; }
 echo "targets OK: $TARGETS (found $first)"
 
+# Recentered alignment (mod A): compute the dataset-mean target once (cheap CPU),
+# then pass it to training. RECENTER=0 disables.
+RECENTER="${RECENTER:-1}"
+ALIGN_MEAN="$TARGETS/align_mean.pt"
+if [ "$RECENTER" = "1" ]; then
+  [ -f "$ALIGN_MEAN" ] || python -m src.compute_target_mean --target_dir "$TARGETS" --out "$ALIGN_MEAN"
+  RECENTER_ARG="--align_recenter_path $ALIGN_MEAN"
+else
+  RECENTER_ARG=""
+fi
+
 torchrun --nproc-per-node="${NPROC:-8}" --master-port="${PORT:-29531}" -m src.main \
   --epochs "$EPOCHS" \
   --bsz 1 \
@@ -81,6 +92,7 @@ torchrun --nproc-per-node="${NPROC:-8}" --master-port="${PORT:-29531}" -m src.ma
   --decode_weight "$DECODE_WEIGHT" \
   --swap_weight "$SWAP_WEIGHT" \
   --swap_margin "$SWAP_MARGIN" \
+  $RECENTER_ARG \
   --num_samples "$NUM_SAMPLES" \
   ${WANDB_NAME:+--wandb_name "$WANDB_NAME"}
 

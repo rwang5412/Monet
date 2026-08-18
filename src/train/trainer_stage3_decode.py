@@ -56,6 +56,17 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
         super().__init__(*args, **kwargs)
         self.decode_weight = float(getattr(self.args, 'decode_weight', 1.0))
         self.slot_dropout = int(getattr(self.args, 'slot_dropout', 2))
+        # Recentered alignment (mod A): subtract the dataset-mean target latent
+        # from the loaded targets so the cosine budget goes to the content
+        # subspace, not the shared mean. Path set via --align_recenter_path.
+        self._align_mean = None
+        _amp = getattr(self.args, 'align_recenter_path', None)
+        if _amp:
+            try:
+                self._align_mean = torch.load(_amp, map_location="cpu")["mean"].float()
+                logging.info(f"recentered alignment ON: mean {tuple(self._align_mean.shape)} from {_amp}")
+            except Exception as e:
+                logging.warning(f"align_recenter_path load failed ({e!r}); alignment NOT recentered")
         self.swap_weight = float(getattr(self.args, 'swap_weight', 0.0))
         self.swap_margin = float(getattr(self.args, 'swap_margin', 0.15))
         self.swap_every = int(getattr(self.args, 'swap_every', 1))
