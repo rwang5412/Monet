@@ -136,6 +136,23 @@ if args.stage == 'sft_stage2' and getattr(args, 'grounding_weight', 0.0) > 0:
         d_model=config.text_config.hidden_size if hasattr(config, 'text_config') else config.hidden_size,
         queue_size=args.grounding_queue_size, temp=args.grounding_temp)
 
+# Stage-3 modification: attach the decode-CE decoder (L_dec) so its params live in
+# the optimizer + checkpoints. Discarded at inference. Inert unless
+# --decode_weight > 0. JL-init the token embedding from the backbone so the
+# language-prior geometry is preserved at the decoder's smaller width.
+if args.stage == 'sft_stage3' and getattr(args, 'decode_weight', 0.0) > 0:
+    from src.train.decode_loss import LatentObsDecoder
+    _d_latent = config.text_config.hidden_size if hasattr(config, 'text_config') else config.hidden_size
+    _emb = model.get_input_embeddings()
+    _dec = LatentObsDecoder(
+        vocab_size=int(_emb.weight.shape[0]), d_latent=int(_d_latent),
+        d_dec=int(getattr(args, 'decode_d', 1024)),
+        n_layers=int(getattr(args, 'decode_layers', 4)),
+        max_len=int(getattr(args, 'decode_max_len', 96)),
+        pad_id=int(getattr(processor.tokenizer, 'pad_token_id', 0) or 0))
+    _dec.init_token_emb_from_backbone(_emb.weight.data)
+    model.latent_obs_decoder = _dec.to(model.dtype)
+
 
 def collate_fn_sft_stage1(examples):
     # examples: list of {conversation: [...], sample_id: int}
@@ -362,7 +379,13 @@ elif args.stage == 'sft_stage2':
     CustomTrainer = CustomTrainerSFT_STAGE2
     collate_fn = partial(collate_fn_sft_stage2)
 elif args.stage == 'sft_stage3':
-    CustomTrainer = CustomTrainerSFT_STAGE3
+    # Modified Stage 3 uses the decode-CE trainer when --decode_weight > 0
+    # (the causal lever); otherwise the stock Stage-3 trainer.
+    if getattr(args, 'decode_weight', 0.0) > 0:
+        from src.train.trainer_stage3_decode import CustomTrainerSFT_STAGE3_Decode
+        CustomTrainer = CustomTrainerSFT_STAGE3_Decode
+    else:
+        CustomTrainer = CustomTrainerSFT_STAGE3
     collate_fn = partial(collate_fn_sft_stage3)
 
 if args.deepspeed != "":
@@ -432,6 +455,8 @@ elif args.stage in ['sft_stage2','sft_stage3']:
     setattr(training_args, 'obs_residual_margin', args.obs_residual_margin)
     setattr(training_args, 'grounding_weight', args.grounding_weight)
     setattr(training_args, 'alignment_layer_indices', args.alignment_layer_indices)
+    # Stage-3 modification: decode-CE writer loss (L_dec, the causal lever)
+    setattr(training_args, 'decode_weight', getattr(args, 'decode_weight', 0.0))
 
 # Initialize the trainer (callbacks that need trainer instance will be added after)
 trainer = CustomTrainer(

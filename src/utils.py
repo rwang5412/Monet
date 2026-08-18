@@ -56,6 +56,13 @@ def get_args():
                         help="lambda for the latent-grounding InfoNCE (Stage-2 Change 2); 0 disables.")
     parser.add_argument("--grounding_queue_size", type=int, default=4096)
     parser.add_argument("--grounding_temp", type=float, default=0.07)
+    # Stage-3 modification: decode-CE writer loss (L_dec, the causal lever).
+    parser.add_argument("--decode_weight", type=float, default=0.0,
+                        help="lambda for the decode-CE loss (Stage-3): the K latents must "
+                             "reconstruct the observation sentence alone. 0 disables (stock Stage 3).")
+    parser.add_argument("--decode_d", type=int, default=1024, help="L_dec decoder width.")
+    parser.add_argument("--decode_layers", type=int, default=4, help="L_dec decoder depth.")
+    parser.add_argument("--decode_max_len", type=int, default=96, help="L_dec max observation length.")
     parser.add_argument("--no_aux_images", action='store_true', default=False,
                         help="precompute_teacher_reps.py only: run the teacher WITHOUT auxiliary "
                              "images (produces the h_neg cache for the residual objective).")
