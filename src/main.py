@@ -457,6 +457,7 @@ elif args.stage in ['sft_stage2','sft_stage3']:
     setattr(training_args, 'alignment_layer_indices', args.alignment_layer_indices)
     # Stage-3 modification: decode-CE writer loss (L_dec) + random-donor margin swap (L_swap)
     setattr(training_args, 'decode_weight', getattr(args, 'decode_weight', 0.0))
+    setattr(training_args, 'slot_dropout', getattr(args, 'slot_dropout', 2))
     setattr(training_args, 'swap_weight', getattr(args, 'swap_weight', 0.0))
     setattr(training_args, 'swap_margin', getattr(args, 'swap_margin', 0.15))
     setattr(training_args, 'swap_every', getattr(args, 'swap_every', 1))

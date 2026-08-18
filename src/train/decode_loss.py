@@ -59,22 +59,37 @@ class LatentObsDecoder(nn.Module):
         proj = torch.randn(d_model, self.tok.weight.shape[1], generator=g) / (d_model ** 0.5)
         self.tok.weight.copy_(backbone_embed_weight.float().cpu() @ proj)
 
-    def forward(self, z: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, target_ids: torch.Tensor,
+                slot_dropout: int = 0) -> torch.Tensor:
         """CE of reconstructing `target_ids` from latents `z` alone.
 
         z:          [B, K, d_latent]  (the K generated latents of each sample)
         target_ids: [B, T] observation-span token ids, pad_id-padded.
+        slot_dropout: if >0 (training only), randomly hide this many of the K
+            slots from cross-attention so no SINGLE slot can be the sole carrier
+            (decode-CE forces the block to carry the sentence, but a lone
+            informative slot + copies could still decode; this forces the load to
+            SPREAD, directly attacking within_block_sim 0.92).
         Returns mean CE over non-pad target tokens.
         """
         B, T = target_ids.shape
         assert T <= self.max_len, f"target len {T} > max_len {self.max_len}"
+        K = z.shape[1]
         mem = self.proj(z.float())                                    # [B, K, d]
+        mem_key_padding = None
+        if self.training and slot_dropout > 0 and slot_dropout < K:
+            # hide `slot_dropout` random slots per sample (True = ignore)
+            mask = torch.zeros(B, K, dtype=torch.bool, device=mem.device)
+            for b in range(B):
+                drop = torch.randperm(K, device=mem.device)[:slot_dropout]
+                mask[b, drop] = True
+            mem_key_padding = mask
         # teacher forcing: input is <shifted> targets; BOS is a zeros row.
         tok = self.tok(target_ids.clamp_min(0))
         tok = torch.cat([torch.zeros_like(tok[:, :1]), tok[:, :-1]], dim=1)
         x = tok + self.pos(torch.arange(T, device=tok.device))[None]
         causal = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
-        h = self.layers(x, mem, tgt_mask=causal)
+        h = self.layers(x, mem, tgt_mask=causal, memory_key_padding_mask=mem_key_padding)
         logits = self.head(self.norm(h))                              # [B, T, V]
         loss = nn.functional.cross_entropy(
             logits.reshape(-1, logits.shape[-1]).float(),

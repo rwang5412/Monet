@@ -29,21 +29,23 @@ from src.train.span_nll import nll_on_positions
 
 
 class DonorBank:
-    """Ring of recent detached latent blocks [K, d] to draw swap donors from.
-    bsz=1 has no in-batch donor, so we keep a small cross-step bank (no RNG:
-    donor index is derived from the global step, so runs are reproducible)."""
+    """Ring of recent detached latent blocks [K, d], each tagged with an answer
+    key, to draw swap donors from. bsz=1 has no in-batch donor, so we keep a
+    small cross-step bank. Draws are DIFFERENT-ANSWER only: a same-answer donor
+    asks the model to become wrong about an answer the donor's latents still
+    support (self-cancelling). No RNG -- the draw index is derived from the step."""
     def __init__(self, size: int = 64):
         self.size = size
-        self.buf = []
+        self.buf = []   # list of (z_cpu, answer_key)
 
-    def push(self, z: torch.Tensor):
-        self.buf.append(z.detach().to("cpu"))
+    def push(self, z: torch.Tensor, answer_key):
+        self.buf.append((z.detach().to("cpu"), answer_key))
         if len(self.buf) > self.size:
             self.buf.pop(0)
 
-    def draw(self, step: int, shape) -> torch.Tensor | None:
-        # need at least one prior block of the SAME shape (same K, d)
-        cand = [b for b in self.buf[:-1] if b.shape == shape]
+    def draw(self, step: int, shape, answer_key) -> torch.Tensor | None:
+        cand = [b for (b, k) in self.buf[:-1]
+                if b.shape == shape and k != answer_key]   # same shape, diff answer
         if not cand:
             return None
         return cand[step % len(cand)]
@@ -53,6 +55,7 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.decode_weight = float(getattr(self.args, 'decode_weight', 1.0))
+        self.slot_dropout = int(getattr(self.args, 'slot_dropout', 2))
         self.swap_weight = float(getattr(self.args, 'swap_weight', 0.0))
         self.swap_margin = float(getattr(self.args, 'swap_margin', 0.15))
         self.swap_every = int(getattr(self.args, 'swap_every', 1))
@@ -71,16 +74,31 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
                             device=ids.device, dtype=torch.long)
         return ids.index_select(0, poss) if poss.numel() else None
 
-    def _answer_positions(self, inputs):
-        """Labeled response positions (obs + reasoning + answer) for the swap NLL."""
+    def _obs_positions(self, inputs):
+        """Observation-span positions for the swap NLL. The swap is SUPERVISED on
+        observations (answer NLL is ~0.11 under teacher-forcing -> no gradient);
+        the answer-level causality claim is VERIFIED separately by free-gen do(Z)."""
+        obs_poss = inputs.get('observation_poss', [None])[0]
+        if not obs_poss:
+            return None
+        L = inputs['input_ids'][0].numel()
+        return [p for p in obs_poss if 0 < p < L]
+
+    def _answer_key(self, inputs):
+        """A cheap key for 'same final answer': the tail labeled token ids. Used to
+        draw DIFFERENT-answer donors (same-answer donors are self-cancelling)."""
         labels = inputs.get('labels', inputs.get('student_labels'))
+        ids = inputs['input_ids'][0]
         if labels is None:
             return None
-        lab = labels[0]
-        return (lab != -100).nonzero(as_tuple=False).flatten().tolist()
+        lab_pos = (labels[0] != -100).nonzero(as_tuple=False).flatten()
+        if lab_pos.numel() == 0:
+            return None
+        tail = lab_pos[-6:]                       # last few response tokens ~ the boxed answer
+        return tuple(ids.index_select(0, tail).tolist())
 
     def _span_nll(self, model, inputs, z, positions):
-        """Answer-span NLL of this row under latents z (teacher-forced)."""
+        """Span NLL of this row under latents z (teacher-forced)."""
         fwd = dict(
             input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'],
             pixel_values=inputs['pixel_values'], image_grid_thw=inputs['image_grid_thw'],
@@ -93,7 +111,8 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         obs_ids = self._obs_target_ids(inputs)
-        ans_pos = self._answer_positions(inputs)
+        obs_pos = self._obs_positions(inputs)
+        ans_key = self._answer_key(inputs)
         base = super().compute_loss(model, inputs, return_outputs=return_outputs,
                                     num_items_in_batch=num_items_in_batch)
         loss = base[0] if isinstance(base, tuple) else base
@@ -105,7 +124,8 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
             try:
                 zt = z.unsqueeze(0) if z.dim() == 2 else z
                 tgt = obs_ids.unsqueeze(0)[:, :dec.max_len]
-                l_dec = dec(zt.to(next(dec.parameters()).dtype), tgt)
+                l_dec = dec(zt.to(next(dec.parameters()).dtype), tgt,
+                            slot_dropout=self.slot_dropout)
                 loss = loss + self.decode_weight * l_dec
                 self._dec_loss_cum += float(l_dec.detach().item())
                 self._dec_gap_cum += dec.decode_gap(zt.detach(), tgt)
@@ -115,31 +135,31 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
                     self._dec_err = getattr(self, '_dec_err', 0) + 1
                     logging.warning(f"L_dec skipped: {e!r}")
 
-        # ---- L_swap: reader-side redirect (random donor, accuracy-preserving) ----
+        # ---- L_swap: reader-side redirect (different-answer donor, obs span) ----
         step = int(getattr(self.state, 'global_step', 0) or 0)
-        if (self.swap_weight > 0 and z is not None and ans_pos
+        if (self.swap_weight > 0 and z is not None and obs_pos
                 and 'ce_patch_pos' in inputs and (step % max(1, self.swap_every) == 0)):
             try:
                 zt = z if z.dim() == 2 else z[0]
-                donor = self._bank.draw(step, zt.shape)
+                donor = self._bank.draw(step, zt.shape, ans_key)
                 if donor is not None:
                     donor = donor.to(zt.device, zt.dtype)
                     with torch.no_grad():
-                        nll_real = self._span_nll(model, inputs, zt, ans_pos)
-                    nll_donor = self._span_nll(model, inputs, donor, ans_pos)
+                        nll_real = self._span_nll(model, inputs, zt, obs_pos)
+                    nll_donor = self._span_nll(model, inputs, donor, obs_pos)
                     # push nll_donor UP toward nll_real + margin (nll_real detached)
                     l_swap = F.relu(self.swap_margin - (nll_donor - nll_real.detach()))
                     loss = loss + self.swap_weight * l_swap
                     self._swap_loss_cum += float(l_swap.detach().item())
                     self._swap_gap_cum += float((nll_donor - nll_real).detach().item())
                     self._swap_steps += 1
-                self._bank.push(zt)
+                self._bank.push(zt, ans_key)
             except Exception as e:
                 if getattr(self, '_swap_err', 0) < 5:
                     self._swap_err = getattr(self, '_swap_err', 0) + 1
                     logging.warning(f"L_swap skipped: {e!r}")
         elif self.swap_weight > 0 and z is not None:
-            self._bank.push(z if z.dim() == 2 else z[0])
+            self._bank.push(z if z.dim() == 2 else z[0], ans_key)
 
         return (loss, None) if return_outputs else loss
 

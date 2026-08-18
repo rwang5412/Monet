@@ -63,6 +63,9 @@ def get_args():
     parser.add_argument("--decode_d", type=int, default=1024, help="L_dec decoder width.")
     parser.add_argument("--decode_layers", type=int, default=4, help="L_dec decoder depth.")
     parser.add_argument("--decode_max_len", type=int, default=96, help="L_dec max observation length.")
+    parser.add_argument("--slot_dropout", type=int, default=2,
+                        help="L_dec: hide this many of K slots from the decoder's cross-attention "
+                             "each step so no single slot is the sole carrier (breaks within-block 0.92).")
     # Stage-3 modification: random-donor margin swap (reader-side, accuracy-preserving).
     parser.add_argument("--swap_weight", type=float, default=0.0,
                         help="lambda for L_swap (Stage-3): a random donor's latents must make "
