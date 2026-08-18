@@ -63,6 +63,15 @@ def get_args():
     parser.add_argument("--decode_d", type=int, default=1024, help="L_dec decoder width.")
     parser.add_argument("--decode_layers", type=int, default=4, help="L_dec decoder depth.")
     parser.add_argument("--decode_max_len", type=int, default=96, help="L_dec max observation length.")
+    # Stage-3 modification: random-donor margin swap (reader-side, accuracy-preserving).
+    parser.add_argument("--swap_weight", type=float, default=0.0,
+                        help="lambda for L_swap (Stage-3): a random donor's latents must make "
+                             "the answer worse by --swap_margin. 0 disables. Keep LOW (~0.1-0.3).")
+    parser.add_argument("--swap_margin", type=float, default=0.15,
+                        help="target answer-NLL gap donor-vs-real (nats): the causality dial. "
+                             "Small (0.1-0.2) preserves accuracy for a modest do(Z).")
+    parser.add_argument("--swap_every", type=int, default=1, help="compute L_swap every N steps (cost knob).")
+    parser.add_argument("--swap_bank", type=int, default=64, help="donor ring-buffer size.")
     parser.add_argument("--no_aux_images", action='store_true', default=False,
                         help="precompute_teacher_reps.py only: run the teacher WITHOUT auxiliary "
                              "images (produces the h_neg cache for the residual objective).")

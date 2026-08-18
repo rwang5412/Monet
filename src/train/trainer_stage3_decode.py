@@ -1,76 +1,110 @@
-"""Modified Stage-3 trainer: paper Stage-3 (recentered latent alignment + NTP)
-PLUS the decode-CE writer loss L_dec.
+"""Modified Stage-3 trainer: paper Stage-3 (latent alignment + NTP) PLUS two
+accuracy-preserving levers for latent causality.
 
-Rationale (from the Stage-2 gate verdict + review):
-  * Stage-2 latents are content-inert to the LM: presence-causal (+1.42 nats)
-    but content-inert (+0.007). rank 54 / nce 0.77 bought nothing causally.
-  * within_block_sim = 0.92 -- the pooled InfoNCE objective is satisfied by
-    eight redundant slots, so it PERMITS the second collapse axis.
-  * L_dec forces the K latents ALONE to reconstruct the observation sentence.
-    A mean/redundant block cannot decode thousands of distinct sentences, so it
-    is instance-specific, forces slot differentiation, and its target lives in
-    text (the closest proxy for "LM-readable"). No latent/image swapping.
+  L_dec  (writer side) -- the K latents alone must reconstruct the observation
+    sentence. Breaks within-block redundancy (0.92) that pooled InfoNCE permits;
+    discarded at inference, so zero accuracy cost.
 
-L_dec runs on the SAME generated latents the alignment loss sees (the latent
-forward's ce_patch_vec), against the observation-span token ids. The decoder is
-a small, separate module (attached to `model.latent_obs_decoder` in main.py so
-its parameters land in the optimizer) and is DISCARDED at inference.
+  L_swap (reader side) -- REDIRECT, don't remove. Splice a RANDOM other sample's
+    latents (donor) into this row and require the answer to get slightly worse:
+        L_swap = relu(margin - (nll_donor - nll_real)),   nll_real detached.
+    No counterfactual pairs, no VLM, no bbox -- the donor is any recent latent
+    block. The MARGIN is the causality dial: small margin (~0.1-0.2 nats) + low
+    weight asks the answer to depend on the latents *a little*, so accuracy is
+    preserved and do(Z) rises modestly (target 2-10%). Nothing is masked, so the
+    image/text accuracy pathways are untouched -- the model is only pushed to
+    *also* use the latents.
 
-decode_gap (shuffled-Z minus real-Z decode loss) is logged every step as the
-tripwire: if it drifts toward zero the decoder is writing from language priors
-and L_dec is a no-op.
+Gate verdict this addresses: content is present (rank 54, retrievable) but the
+LM's reader doesn't USE it (obs content gap ~0). L_swap trains the reader; L_dec
+keeps the writer's slots distinct so there is something to use.
 """
 import logging
 
 import torch
+import torch.nn.functional as F
 
-from src.trainer import CustomTrainerSFT_STAGE3, load_offline_tensor
+from src.trainer import CustomTrainerSFT_STAGE3
+from src.train.span_nll import nll_on_positions
+
+
+class DonorBank:
+    """Ring of recent detached latent blocks [K, d] to draw swap donors from.
+    bsz=1 has no in-batch donor, so we keep a small cross-step bank (no RNG:
+    donor index is derived from the global step, so runs are reproducible)."""
+    def __init__(self, size: int = 64):
+        self.size = size
+        self.buf = []
+
+    def push(self, z: torch.Tensor):
+        self.buf.append(z.detach().to("cpu"))
+        if len(self.buf) > self.size:
+            self.buf.pop(0)
+
+    def draw(self, step: int, shape) -> torch.Tensor | None:
+        # need at least one prior block of the SAME shape (same K, d)
+        cand = [b for b in self.buf[:-1] if b.shape == shape]
+        if not cand:
+            return None
+        return cand[step % len(cand)]
 
 
 class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Weight on the decode-CE writer loss; 0.0 recovers stock modified Stage 3.
         self.decode_weight = float(getattr(self.args, 'decode_weight', 1.0))
-        # Optional recentering vector for the alignment target (modification A):
-        # a [d] tensor of the dataset-mean latent, subtracted from both sides
-        # before the cosine so the alignment budget goes to the content subspace.
-        # Loaded/attached in main.py; None => stock alignment.
-        self._align_recenter = getattr(self.args, '_align_recenter_vec', None)
-        self._dec_loss_cum = 0.0
-        self._dec_gap_cum = 0.0
+        self.swap_weight = float(getattr(self.args, 'swap_weight', 0.0))
+        self.swap_margin = float(getattr(self.args, 'swap_margin', 0.15))
+        self.swap_every = int(getattr(self.args, 'swap_every', 1))
+        self._bank = DonorBank(size=int(getattr(self.args, 'swap_bank', 64)))
+        self._dec_loss_cum = self._dec_gap_cum = 0.0
         self._dec_steps = 0
+        self._swap_loss_cum = self._swap_gap_cum = 0.0
+        self._swap_steps = 0
 
     def _obs_target_ids(self, inputs):
-        """Observation-span token ids [T] for this (bsz=1) row, for L_dec."""
         obs_poss = inputs.get('observation_poss', [None])[0]
         ids = inputs['student_input_ids'][0]
         if not obs_poss:
             return None
         poss = torch.tensor([p for p in obs_poss if 0 <= p < ids.numel()],
                             device=ids.device, dtype=torch.long)
-        if poss.numel() == 0:
+        return ids.index_select(0, poss) if poss.numel() else None
+
+    def _answer_positions(self, inputs):
+        """Labeled response positions (obs + reasoning + answer) for the swap NLL."""
+        labels = inputs.get('labels', inputs.get('student_labels'))
+        if labels is None:
             return None
-        return ids.index_select(0, poss)   # [T]
+        lab = labels[0]
+        return (lab != -100).nonzero(as_tuple=False).flatten().tolist()
+
+    def _span_nll(self, model, inputs, z, positions):
+        """Answer-span NLL of this row under latents z (teacher-forced)."""
+        fwd = dict(
+            input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'],
+            pixel_values=inputs['pixel_values'], image_grid_thw=inputs['image_grid_thw'],
+            ce_patch_pos=inputs['ce_patch_pos'], ce_patch_vec=[z],
+            labels=inputs['labels'], loss_type=['ce'], latent_mode=False, return_dict=True)
+        if 'attention_mask_4d' in inputs:
+            fwd['attention_mask_4d'] = inputs['attention_mask_4d']
+        out = model(**fwd)
+        return nll_on_positions(out.logits[0], inputs['input_ids'][0], positions)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # The parent runs the latent forward + CE + alignment and returns the
-        # combined loss; we re-run its body but capture the generated latents so
-        # we can add L_dec. To avoid duplicating the (long) parent body, call it
-        # and read the latents it stashed.
         obs_ids = self._obs_target_ids(inputs)
+        ans_pos = self._answer_positions(inputs)
         base = super().compute_loss(model, inputs, return_outputs=return_outputs,
                                     num_items_in_batch=num_items_in_batch)
         loss = base[0] if isinstance(base, tuple) else base
-
-        # The parent stashed the latent-forward output's latents on the trainer
-        # via _last_latents (added below). Guard if absent (e.g. CE-only row).
         z = getattr(self, '_last_latents', None)
-        dec = getattr(unwrap(model), 'latent_obs_decoder', None)
-        if dec is not None and z is not None and obs_ids is not None:
+
+        # ---- L_dec: writer-side redundancy breaker ----
+        dec = getattr(_unwrap(model), 'latent_obs_decoder', None)
+        if dec is not None and z is not None and obs_ids is not None and self.decode_weight > 0:
             try:
-                zt = z.unsqueeze(0) if z.dim() == 2 else z          # [1,K,d]
-                tgt = obs_ids.unsqueeze(0)[:, :dec.max_len]         # [1,T]
+                zt = z.unsqueeze(0) if z.dim() == 2 else z
+                tgt = obs_ids.unsqueeze(0)[:, :dec.max_len]
                 l_dec = dec(zt.to(next(dec.parameters()).dtype), tgt)
                 loss = loss + self.decode_weight * l_dec
                 self._dec_loss_cum += float(l_dec.detach().item())
@@ -80,6 +114,33 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
                 if getattr(self, '_dec_err', 0) < 5:
                     self._dec_err = getattr(self, '_dec_err', 0) + 1
                     logging.warning(f"L_dec skipped: {e!r}")
+
+        # ---- L_swap: reader-side redirect (random donor, accuracy-preserving) ----
+        step = int(getattr(self.state, 'global_step', 0) or 0)
+        if (self.swap_weight > 0 and z is not None and ans_pos
+                and 'ce_patch_pos' in inputs and (step % max(1, self.swap_every) == 0)):
+            try:
+                zt = z if z.dim() == 2 else z[0]
+                donor = self._bank.draw(step, zt.shape)
+                if donor is not None:
+                    donor = donor.to(zt.device, zt.dtype)
+                    with torch.no_grad():
+                        nll_real = self._span_nll(model, inputs, zt, ans_pos)
+                    nll_donor = self._span_nll(model, inputs, donor, ans_pos)
+                    # push nll_donor UP toward nll_real + margin (nll_real detached)
+                    l_swap = F.relu(self.swap_margin - (nll_donor - nll_real.detach()))
+                    loss = loss + self.swap_weight * l_swap
+                    self._swap_loss_cum += float(l_swap.detach().item())
+                    self._swap_gap_cum += float((nll_donor - nll_real).detach().item())
+                    self._swap_steps += 1
+                self._bank.push(zt)
+            except Exception as e:
+                if getattr(self, '_swap_err', 0) < 5:
+                    self._swap_err = getattr(self, '_swap_err', 0) + 1
+                    logging.warning(f"L_swap skipped: {e!r}")
+        elif self.swap_weight > 0 and z is not None:
+            self._bank.push(z if z.dim() == 2 else z[0])
+
         return (loss, None) if return_outputs else loss
 
     def log(self, logs, start_time=None):
@@ -89,11 +150,17 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
             merged["decode_gap"] = round(self._dec_gap_cum / self._dec_steps, 6)
             self._dec_loss_cum = self._dec_gap_cum = 0.0
             self._dec_steps = 0
+        if self._swap_steps > 0:
+            merged["swap_loss"] = round(self._swap_loss_cum / self._swap_steps, 6)
+            # swap_gap = nll_donor - nll_real; this is the training-time causality
+            # signal we want to see RISE toward swap_margin (do(Z) proxy).
+            merged["swap_gap"] = round(self._swap_gap_cum / self._swap_steps, 6)
+            self._swap_loss_cum = self._swap_gap_cum = 0.0
+            self._swap_steps = 0
         return super().log(merged, start_time)
 
 
-def unwrap(model):
-    """Peel DeepSpeed/DDP wrappers to reach the attached decoder."""
+def _unwrap(model):
     m = model
     for _ in range(4):
         if hasattr(m, 'latent_obs_decoder'):

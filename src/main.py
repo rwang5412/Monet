@@ -379,9 +379,9 @@ elif args.stage == 'sft_stage2':
     CustomTrainer = CustomTrainerSFT_STAGE2
     collate_fn = partial(collate_fn_sft_stage2)
 elif args.stage == 'sft_stage3':
-    # Modified Stage 3 uses the decode-CE trainer when --decode_weight > 0
-    # (the causal lever); otherwise the stock Stage-3 trainer.
-    if getattr(args, 'decode_weight', 0.0) > 0:
+    # Modified Stage 3 uses the decode-CE / margin-swap trainer when either lever
+    # is on (--decode_weight or --swap_weight > 0); otherwise stock Stage 3.
+    if getattr(args, 'decode_weight', 0.0) > 0 or getattr(args, 'swap_weight', 0.0) > 0:
         from src.train.trainer_stage3_decode import CustomTrainerSFT_STAGE3_Decode
         CustomTrainer = CustomTrainerSFT_STAGE3_Decode
     else:
@@ -455,8 +455,12 @@ elif args.stage in ['sft_stage2','sft_stage3']:
     setattr(training_args, 'obs_residual_margin', args.obs_residual_margin)
     setattr(training_args, 'grounding_weight', args.grounding_weight)
     setattr(training_args, 'alignment_layer_indices', args.alignment_layer_indices)
-    # Stage-3 modification: decode-CE writer loss (L_dec, the causal lever)
+    # Stage-3 modification: decode-CE writer loss (L_dec) + random-donor margin swap (L_swap)
     setattr(training_args, 'decode_weight', getattr(args, 'decode_weight', 0.0))
+    setattr(training_args, 'swap_weight', getattr(args, 'swap_weight', 0.0))
+    setattr(training_args, 'swap_margin', getattr(args, 'swap_margin', 0.15))
+    setattr(training_args, 'swap_every', getattr(args, 'swap_every', 1))
+    setattr(training_args, 'swap_bank', getattr(args, 'swap_bank', 64))
 
 # Initialize the trainer (callbacks that need trainer instance will be added after)
 trainer = CustomTrainer(

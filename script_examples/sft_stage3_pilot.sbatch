@@ -25,7 +25,9 @@ TARGETS="${TARGETS:-/scratch/$USER/monet_ckpts/teacher_latents_modified}"
 LATENT_SIZE="${LATENT_SIZE:-8}"
 ALIGNMENT_WEIGHT="${ALIGNMENT_WEIGHT:-2.0}"
 CE_EMPHASIZE_FACTOR="${CE_EMPHASIZE_FACTOR:-4.0}"
-DECODE_WEIGHT="${DECODE_WEIGHT:-1.0}"        # the causal lever; 0 = stock Stage 3
+DECODE_WEIGHT="${DECODE_WEIGHT:-1.0}"        # writer-side redundancy breaker
+SWAP_WEIGHT="${SWAP_WEIGHT:-0.2}"            # reader-side redirect; LOW to preserve accuracy
+SWAP_MARGIN="${SWAP_MARGIN:-0.15}"           # causality dial (nats); target modest do(Z)
 EPOCHS="${EPOCHS:-1}"
 NUM_SAMPLES="${NUM_SAMPLES:-32000}"          # pilot subset; unset/large for full run
 
@@ -77,6 +79,8 @@ torchrun --nproc-per-node="${NPROC:-8}" --master-port="${PORT:-29531}" -m src.ma
   --alignment_layer all_layers \
   --teacher_latent_dir "$TARGETS" \
   --decode_weight "$DECODE_WEIGHT" \
+  --swap_weight "$SWAP_WEIGHT" \
+  --swap_margin "$SWAP_MARGIN" \
   --num_samples "$NUM_SAMPLES" \
   ${WANDB_NAME:+--wandb_name "$WANDB_NAME"}
 
