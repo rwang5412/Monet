@@ -152,38 +152,58 @@ def main():
     # The zero condition separates "latents unused" from "present but content-inert".
     #   nll(donor) - nll(real) > 0  => the LM READS sample-specific content
     #   nll(zero)  - nll(real) > 0  => the LM uses the latents' presence at all
-    def obs_nll_acc(ce_in, obs_poss, pos_list, zz):
-        out = student(**ce_in, ce_patch_pos=[pos_list], ce_patch_vec=[zz],
-                      loss_type=['ce'], return_dict=True)
-        lg = out.logits[0].float()                              # [S, V]
-        poss = torch.tensor(obs_poss, device=lg.device, dtype=torch.long)
-        lab = ce_in['labels'][0][poss]                          # target token at poss
+    # Gather NLL+acc at a position set from precomputed logits (poss-1 predicts poss).
+    def _gather(lg, labels_row, poss):
+        if not poss:
+            return None, None
+        p = torch.tensor(poss, device=lg.device, dtype=torch.long)
+        lab = labels_row[p]
         valid = lab != -100
         if int(valid.sum()) == 0:
             return None, None
-        pred = lg[poss - 1][valid]                              # logits[poss-1] predicts poss
+        pred = lg[p - 1][valid]
         tgt = lab[valid]
         logp = F.log_softmax(pred, dim=-1)
         nll = float(-logp[torch.arange(tgt.numel(), device=lg.device), tgt].mean())
         acc = float((pred.argmax(-1) == tgt).float().mean())
         return nll, acc
 
-    nll_r, nll_d, nll_z, acc_r, acc_d, acc_z = ([] for _ in range(6))
+    # One forward per latent condition; score BOTH the observation tokens and the
+    # ANSWER tokens (labeled response tokens that are NOT observations -- reasoning
+    # + final answer). do(Z) is answer-level, so obs-causality can be won while the
+    # answer stays latent-independent -- we must see both.
+    def run_cond(ce_in, obs_poss, ans_poss, pos_list, zz):
+        out = student(**ce_in, ce_patch_pos=[pos_list], ce_patch_vec=[zz],
+                      loss_type=['ce'], return_dict=True)
+        lg = out.logits[0].float()
+        lab = ce_in['labels'][0]
+        return _gather(lg, lab, obs_poss), _gather(lg, lab, ans_poss)
+
+    o_nr, o_nd, o_nz, o_ar, o_ad, o_az = ([] for _ in range(6))   # obs NLL/acc
+    a_nr, a_nd, a_nz, a_ar, a_ad, a_az = ([] for _ in range(6))   # answer NLL/acc
     with torch.inference_mode():
         for j, (inp, z, pos_list) in enumerate(real_pack):
             donor = real_pack[(j + 1) % len(real_pack)][1]
             if donor.shape != z.shape:
                 continue
             ce_in, obs_poss = obs_token_acc_inputs(inp, processor, device=dev)
+            labeled = (ce_in['labels'][0] != -100).nonzero(as_tuple=False).flatten().tolist()
+            obs_set = set(obs_poss)
+            ans_poss = [p for p in labeled if p not in obs_set]   # reasoning + answer
             zero = torch.zeros_like(z)
-            for zz, ns, as_ in ((z, nll_r, acc_r), (donor, nll_d, acc_d), (zero, nll_z, acc_z)):
-                nll, acc = obs_nll_acc(ce_in, obs_poss, pos_list, zz)
-                if nll is not None:
-                    ns.append(nll); as_.append(acc)
+            for zz, on, oa, an_, aa in ((z, o_nr, o_ar, a_nr, a_ar),
+                                        (donor, o_nd, o_ad, a_nd, a_ad),
+                                        (zero, o_nz, o_az, a_nz, a_az)):
+                (onll, oacc), (anll, aacc) = run_cond(ce_in, obs_poss, ans_poss, pos_list, zz)
+                if onll is not None:
+                    on.append(onll); oa.append(oacc)
+                if anll is not None:
+                    an_.append(anll); aa.append(aacc)
 
     mean = lambda xs: sum(xs) / max(len(xs), 1)
-    ar, ad, az = mean(acc_r), mean(acc_d), mean(acc_z)
-    nr, nd, nz = mean(nll_r), mean(nll_d), mean(nll_z)
+    ar, ad, az = mean(o_ar), mean(o_ad), mean(o_az)
+    nr, nd, nz = mean(o_nr), mean(o_nd), mean(o_nz)
+    ban_r, ban_d, ban_z = mean(a_nr), mean(a_nd), mean(a_nz)   # answer NLLs
     report = {
         "n_scored": n,
         "cross_sample_sim": cross,
@@ -192,9 +212,12 @@ def main():
         "s_pos_minus_s_neg": sum(s_gap) / max(len(s_gap), 1),
         "obs_acc_real": ar, "obs_acc_donor": ad, "obs_acc_zero": az,
         "obs_nll_real": nr, "obs_nll_donor": nd, "obs_nll_zero": nz,
+        "ans_nll_real": ban_r, "ans_nll_donor": ban_d, "ans_nll_zero": ban_z,
         "intervention_gap_acc": ar - ad,
-        "content_nll_gap": nd - nr,     # donor - real: content-causality
-        "presence_nll_gap": nz - nr,    # zero  - real: presence-causality
+        "content_nll_gap": nd - nr,          # obs: donor - real (content-causality)
+        "presence_nll_gap": nz - nr,         # obs: zero  - real (presence-causality)
+        "ans_content_nll_gap": ban_d - ban_r,  # ANSWER content-causality (do(Z) proxy)
+        "ans_presence_nll_gap": ban_z - ban_r,
     }
     json.dump(report, open(args.out, "w"), indent=2)
     W = 66
@@ -207,8 +230,11 @@ def main():
     print(f"  s_pos - s_neg (student) = {report['s_pos_minus_s_neg']:+.4f}   (want > 0; ~0 => mask leak)")
     print(f"  obs acc  real/donor/zero= {ar:.4f} / {ad:.4f} / {az:.4f}")
     print(f"  obs NLL  real/donor/zero= {nr:.4f} / {nd:.4f} / {nz:.4f}")
-    print(f"  content  NLL gap (d-r)  = {nd - nr:+.4f}   (want > 0: LM reads content)")
-    print(f"  presence NLL gap (z-r)  = {nz - nr:+.4f}   (want > 0: LM uses presence)")
+    print(f"  ans NLL  real/donor/zero= {ban_r:.4f} / {ban_d:.4f} / {ban_z:.4f}")
+    print(f"  OBS content NLL gap(d-r)= {nd - nr:+.4f}   (want > 0: LM reads content)")
+    print(f"  OBS presence NLL gap(z-r)= {nz - nr:+.4f}  (want > 0: LM uses presence)")
+    print(f"  ANS content NLL gap(d-r)= {ban_d - ban_r:+.4f}   (the do(Z) proxy: answer reads content)")
+    print(f"  ANS presence NLL gap(z-r)= {ban_z - ban_r:+.4f}")
     # Promotion requires a MEANINGFUL content effect, not just sign. A ~0.02-nat
     # floor keeps a rounding-artifact gap (the old +0.0001) from printing PASS.
     ok = cross < 0.9 and eff_rank > 10 and (nd - nr) > 0.02
