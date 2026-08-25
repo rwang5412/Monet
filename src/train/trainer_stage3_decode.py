@@ -92,14 +92,17 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
         obs_poss = inputs.get('observation_poss', [None])[0]
         if not obs_poss:
             return None
-        L = inputs['input_ids'][0].numel()
+        # NOTE: at the top of compute_loss the parent has not yet created
+        # inputs['input_ids'] (it aliases student_input_ids inside its body), so
+        # read the student key here.
+        L = inputs['student_input_ids'][0].numel()
         return [p for p in obs_poss if 0 < p < L]
 
     def _answer_key(self, inputs):
         """A cheap key for 'same final answer': the tail labeled token ids. Used to
         draw DIFFERENT-answer donors (same-answer donors are self-cancelling)."""
-        labels = inputs.get('labels', inputs.get('student_labels'))
-        ids = inputs['input_ids'][0]
+        labels = inputs.get('student_labels', inputs.get('labels'))
+        ids = inputs['student_input_ids'][0]     # 'input_ids' not aliased yet at top
         if labels is None:
             return None
         lab_pos = (labels[0] != -100).nonzero(as_tuple=False).flatten()
