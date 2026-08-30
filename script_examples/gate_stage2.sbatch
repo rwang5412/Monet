@@ -30,11 +30,15 @@ LATENT_SIZE="${LATENT_SIZE:-8}"
 source ~/.bashrc || true
 conda activate monet
 cd "${REPO_DIR:-$SLURM_SUBMIT_DIR}"
+echo "=== CODE: $(git rev-parse --short HEAD 2>/dev/null || echo unknown) ($(git log -1 --format=%cd --date=short 2>/dev/null)) on $(hostname), job ${SLURM_JOB_ID:-none} ==="
+if git fetch -q origin 2>/dev/null && [ "$(git rev-parse HEAD)" != "$(git rev-parse '@{u}')" ]; then
+  echo "WARN: checkout is BEHIND origin -- this job is running STALE code (git pull --ff-only before sbatch)"
+fi
 mkdir -p "/scratch/$USER/logs"
 
 # Pull the latest gate fix (harmless if already current). Never abort the job on
 # a pull hiccup -- the on-disk code may already be up to date.
-git pull --ff-only 2>/dev/null || echo "WARN: git pull skipped (not fast-forwardable); using on-disk code"
+if git pull --ff-only 2>/dev/null; then echo "=== after pull: $(git rev-parse --short HEAD) ==="; else echo "WARN: git pull skipped (not fast-forwardable); using on-disk code"; fi
 
 run_gate () {  # $1 = n, $2 = extra label, remaining = env prefix handled by caller
   python -m src.gate_stage2 \

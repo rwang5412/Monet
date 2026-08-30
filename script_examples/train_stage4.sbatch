@@ -42,6 +42,10 @@ esac
 source ~/.bashrc || true
 conda activate monet
 cd "${REPO_DIR:-$SLURM_SUBMIT_DIR}"
+echo "=== CODE: $(git rev-parse --short HEAD 2>/dev/null || echo unknown) ($(git log -1 --format=%cd --date=short 2>/dev/null)) on $(hostname), job ${SLURM_JOB_ID:-none} ==="
+if git fetch -q origin 2>/dev/null && [ "$(git rev-parse HEAD)" != "$(git rev-parse '@{u}')" ]; then
+  echo "WARN: checkout is BEHIND origin -- this job is running STALE code (git pull --ff-only before sbatch)"
+fi
 mkdir -p "/scratch/$USER/logs" "$SAVE"
 
 torchrun --nproc-per-node="${NPROC:-2}" --master-port=29517 -m src.main \
