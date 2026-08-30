@@ -46,6 +46,12 @@ EPOCHS="${EPOCHS:-2}"
 MARGIN="${MARGIN:-0.05}"
 GROUNDING_WEIGHT="${GROUNDING_WEIGHT:-1.0}"
 GROUNDING_QUEUE="${GROUNDING_QUEUE:-4096}"
+# Margin recentering: path to residual_mean.pt (src.compute_residual_mean over the
+# pos/neg caches). Subtracts E[h_pos-h_neg] from h_pos so a global shift of the
+# obs states earns no margin. Pilot 14946764 drifted cross_sample_sim 0.5 -> 0.81
+# in 500 steps without it. Empty = off. NOTE: re-check MARGIN against the
+# recentered ceiling the script prints.
+RECENTER_PATH="${RECENTER_PATH:-}"
 # From the layer_sel probe (upper third by separation); caches must be built with
 # the same list via --keep_layers.
 ALIGN_IDX="${ALIGN_IDX:-20,21,22,23,24,25,26,27,28}"
@@ -53,7 +59,7 @@ ALIGN_IDX="${ALIGN_IDX:-20,21,22,23,24,25,26,27,28}"
 # covering gate_stage2's last-300 eval slice) is never seen in training.
 NUM_SAMPLES="${NUM_SAMPLES:-118000}"
 
-SAVE_CKPT="${SAVE_CKPT:-sft_stage2_residual${MARGIN}_ground${GROUNDING_WEIGHT}_latent${LATENT_SIZE}}"
+SAVE_CKPT="${SAVE_CKPT:-sft_stage2_residual${MARGIN}${RECENTER_PATH:+rc}_ground${GROUNDING_WEIGHT}_latent${LATENT_SIZE}}"
 SAVE="/scratch/$USER/monet_ckpts/${SAVE_CKPT}"
 
 source ~/.bashrc || true
@@ -129,6 +135,7 @@ torchrun --nproc-per-node="${NPROC:-8}" --master-port="${PORT:-29511}" -m src.ma
   --alignment_layer_indices "$ALIGN_IDX" \
   --num_samples "$NUM_SAMPLES" \
   --obs_residual_margin "$MARGIN" \
+  ${RECENTER_PATH:+--residual_recenter_path "$RECENTER_PATH"} \
   --grounding_weight "$GROUNDING_WEIGHT" \
   --grounding_queue_size "$GROUNDING_QUEUE" \
   --observation_tokens_cannot_see_question_image \

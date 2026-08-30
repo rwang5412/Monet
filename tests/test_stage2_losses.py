@@ -62,6 +62,42 @@ def test_residual_teacher_shared_content_cancels():
     assert abs(l1 - l2) < 0.05
 
 
+def test_recentering_removes_shared_direction_reward():
+    """Pilot drift mechanism: a student shift along the dataset-mean residual mu
+    earns margin under the plain objective; after subtracting mu from h_pos
+    (residual_recenter_path) it earns ~nothing, while the sample-specific
+    residual is still rewarded."""
+    obs_residual_loss = _residual()
+    g = torch.Generator().manual_seed(3)
+    N = 64
+    mu = F.normalize(torch.randn(D, generator=g), dim=0) * 2.0           # shared direction
+    negs = [torch.randn(LYR, T, D, generator=g) for _ in range(N)]
+    res = [torch.randn(LYR, T, D, generator=g) * 0.5 for _ in range(N)]  # sample-specific
+    poss = [n + mu + r for n, r in zip(negs, res)]
+    # the estimate src.compute_residual_mean would produce: [LYR, D]
+    mu_hat = torch.stack([p - n for p, n in zip(poss, negs)]).mean(0).mean(1)
+    trainer_recenter = lambda p: (p.float() - mu_hat[:, None, :]).to(p.dtype)
+
+    def mean_gap(pos_fn, student_fn):
+        gs = []
+        for n, p, r in zip(negs, poss, res):
+            _, st = obs_residual_loss(pos_fn(p), n, student_fn(n, r), margin=0.05, return_stats=True)
+            gs.append(float(st["residual_gap"]))
+        return sum(gs) / N
+
+    base = lambda n, r: n            # student encodes nothing visual
+    shift = lambda n, r: n + mu      # global shift only (no content)
+    content = lambda n, r: n + r     # the actual sample residual
+    ident = lambda p: p
+
+    plain_shift_reward = mean_gap(ident, shift) - mean_gap(ident, base)
+    rec_shift_reward = mean_gap(trainer_recenter, shift) - mean_gap(trainer_recenter, base)
+    rec_content_reward = mean_gap(trainer_recenter, content) - mean_gap(trainer_recenter, base)
+    assert plain_shift_reward > 0.05, plain_shift_reward       # plain objective pays for the shift
+    assert abs(rec_shift_reward) < 0.02, rec_shift_reward      # recentered: shift earns ~nothing
+    assert rec_content_reward > 0.10, rec_content_reward       # content still pays
+
+
 # ---------------- Change 2: latent grounding ----------------
 def _mk(seed=0):
     torch.manual_seed(seed)

@@ -52,6 +52,11 @@ def get_args():
                              "(closer to h_pos than to h_neg by obs_residual_margin). Generate "
                              "with precompute_teacher_reps.py --no_aux_images.")
     parser.add_argument("--obs_residual_margin", type=float, default=0.2)
+    parser.add_argument("--residual_recenter_path", type=str, default=None,
+                        help="Stage-2 margin recentering: path to residual_mean.pt (from "
+                             "src.compute_residual_mean). Subtracts the dataset-mean residual "
+                             "E[h_pos - h_neg] from h_pos so a global shift of the student's obs "
+                             "states earns no margin (anti cross-sample-sim drift). None = off.")
     parser.add_argument("--grounding_weight", type=float, default=0.0,
                         help="lambda for the latent-grounding InfoNCE (Stage-2 Change 2); 0 disables.")
     parser.add_argument("--grounding_queue_size", type=int, default=4096)

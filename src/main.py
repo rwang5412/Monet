@@ -453,6 +453,7 @@ elif args.stage in ['sft_stage2','sft_stage3']:
     # Stage-2 modifications (residual objective + latent grounding)
     setattr(training_args, 'teacher_reps_neg_dir', args.teacher_reps_neg_dir)
     setattr(training_args, 'obs_residual_margin', args.obs_residual_margin)
+    setattr(training_args, 'residual_recenter_path', getattr(args, 'residual_recenter_path', None))
     setattr(training_args, 'grounding_weight', args.grounding_weight)
     setattr(training_args, 'alignment_layer_indices', args.alignment_layer_indices)
     # Stage-3 modification: decode-CE writer loss (L_dec) + random-donor margin swap (L_swap)

@@ -150,6 +150,18 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
         # Stage-2 changes: residual objective (needs the no-aux teacher cache) and
         # the latent grounding InfoNCE (module attached to the model in main.py).
         self.teacher_reps_neg_dir = getattr(self.args, 'teacher_reps_neg_dir', None)
+        # Margin recentering (anti shared-direction drift). mu = E[h_pos - h_neg]
+        # per kept layer (src.compute_residual_mean). Subtracting it from h_pos
+        # makes h_pos' - h_neg zero-mean over the dataset, so shifting every obs
+        # state along mu earns no margin -- only the sample-specific residual pays.
+        # Pilot 14946764: cross_sample_sim 0.5 -> 0.81 in 500 steps without this.
+        self.residual_mu = None
+        _rp = getattr(self.args, 'residual_recenter_path', None)
+        if _rp:
+            _d = torch.load(_rp, map_location='cpu')
+            self.residual_mu = _d['mean'].float()          # [num_kept_layer, dim]
+            logging.info(f"residual recentering ON: mu {tuple(self.residual_mu.shape)} "
+                         f"from {_rp} (n_files={_d.get('n_files')})")
         self.grounding_weight = float(getattr(self.args, 'grounding_weight', 0.0))
         self.grounding_loss_cum = 0.
         self.grounding_loss_steps = 0
@@ -162,6 +174,12 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
                            "within_block_sim", "cross_sample_sim")}
         self._z_ring = []  # recent pooled latents for cross-sample similarity
 
+    def _recenter(self, h_pos):
+        """h_pos - mu for a cached [num_kept_layer, T_obs, dim] teacher tensor."""
+        mu = self.residual_mu
+        assert h_pos.dim() == 3 and h_pos.shape[0] == mu.shape[0], \
+            f"recenter layer mismatch: cache {tuple(h_pos.shape)} vs mu {tuple(mu.shape)}"
+        return (h_pos.float() - mu[:, None, :]).to(h_pos.dtype)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -175,7 +193,7 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
         inputs['loss_type'] = []
         model.gradient_checkpointing_disable() # since we set use_cache=True in latent forward, we must disable grad checkpointing
         outputs = model(**inputs, return_dict=True, output_hidden_states=False)
-        
+
         # ------------------------------------------------------------------
         # Insert the collected latent embeddings into the latent positions, and forward once.
         # ------------------------------------------------------------------
@@ -210,6 +228,11 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
                 if self.teacher_reps_neg_dir:
                     teacher_reps_neg = load_offline_tensor(self.teacher_reps_neg_dir, batch_metadata=inputs['metadata'],
                     alignment_layer=self.args.alignment_layer)
+                    if self.residual_mu is not None:
+                        # recentered positive teacher: h_pos - mu (mu broadcast over
+                        # the obs-token axis of [num_kept_layer, T_obs, dim]).
+                        # residual_gap / hinge stats are then in recentered terms.
+                        teacher_reps = [self._recenter(t) for t in teacher_reps]
             except RuntimeError as e:
                 self._missing_reps = getattr(self, '_missing_reps', 0) + 1
                 if self._missing_reps <= 5 or self._missing_reps % 100 == 0:
