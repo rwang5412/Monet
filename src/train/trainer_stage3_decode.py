@@ -73,6 +73,7 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
         self._bank = DonorBank(size=int(getattr(self.args, 'swap_bank', 64)))
         self._dec_loss_cum = self._dec_gap_cum = 0.0
         self._dec_steps = 0
+        self._dec_ok_total = 0   # cumulative successes (log() resets _dec_steps)
         self._swap_loss_cum = self._swap_gap_cum = 0.0
         self._swap_steps = 0
 
@@ -144,10 +145,20 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
                 self._dec_loss_cum += float(l_dec.detach().item())
                 self._dec_gap_cum += dec.decode_gap(zt.detach(), tgt)
                 self._dec_steps += 1
+                self._dec_ok_total += 1
             except Exception as e:
-                if getattr(self, '_dec_err', 0) < 5:
-                    self._dec_err = getattr(self, '_dec_err', 0) + 1
+                self._dec_err = getattr(self, '_dec_err', 0) + 1
+                if self._dec_err <= 5:
                     logging.warning(f"L_dec skipped: {e!r}")
+                # Tolerate a sporadic bad row, but NEVER a permanently dead
+                # objective: a bf16 dtype error was swallowed here for two entire
+                # training jobs (15237561, 15427523) -- L_dec contributed nothing
+                # and the logs showed no decode_loss key to notice it by.
+                if self._dec_ok_total == 0 and self._dec_err >= 50:
+                    raise RuntimeError(
+                        f"L_dec is enabled (decode_weight={self.decode_weight}) but has "
+                        f"FAILED on all {self._dec_err} attempts -- the writer lever is "
+                        f"dead, so this run cannot test it. Last error: {e!r}") from e
 
         # ---- L_swap: reader-side redirect (different-answer donor, obs span) ----
         step = int(getattr(self.state, 'global_step', 0) or 0)

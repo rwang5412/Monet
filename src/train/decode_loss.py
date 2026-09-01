@@ -75,7 +75,11 @@ class LatentObsDecoder(nn.Module):
         B, T = target_ids.shape
         assert T <= self.max_len, f"target len {T} > max_len {self.max_len}"
         K = z.shape[1]
-        mem = self.proj(z.float())                                    # [B, K, d]
+        # Run in the decoder's OWN dtype: the module is cast to the backbone dtype
+        # (bf16) at attach time, so a blanket .float() here makes the matmul
+        # Float x BFloat16 and the whole loss is silently skipped by the caller's
+        # try/except (this shipped: L_dec never ran in jobs 15237561/15427523).
+        mem = self.proj(z.to(self.proj.weight.dtype))                 # [B, K, d]
         mem_key_padding = None
         if self.training and slot_dropout > 0 and slot_dropout < K:
             # hide `slot_dropout` random slots per sample (True = ignore)
@@ -88,7 +92,9 @@ class LatentObsDecoder(nn.Module):
         tok = self.tok(target_ids.clamp_min(0))
         tok = torch.cat([torch.zeros_like(tok[:, :1]), tok[:, :-1]], dim=1)
         x = tok + self.pos(torch.arange(T, device=tok.device))[None]
-        causal = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
+        # dtype= matters: the mask defaults to fp32 and is ADDED to bf16 attention
+        # scores (the next dtype error after the proj one).
+        causal = nn.Transformer.generate_square_subsequent_mask(T, device=x.device, dtype=x.dtype)
         h = self.layers(x, mem, tgt_mask=causal, memory_key_padding_mask=mem_key_padding)
         logits = self.head(self.norm(h))                              # [B, T, V]
         loss = nn.functional.cross_entropy(

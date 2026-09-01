@@ -82,3 +82,33 @@ def test_pooled_redundant_block_cannot_decode_two_sentences():
     differentiated = base + 0.5 * torch.randn(2, 8, 32)    # slots differ
     assert fit(redundant) > fit(differentiated), \
         "redundant block should decode worse -- else L_dec doesn't reward slot diversity"
+
+
+def test_forward_runs_in_bf16_module_dtype():
+    """REGRESSION (jobs 15237561 / 15427523): the decoder is attached as
+    `.to(model.dtype)` = bf16, but forward did `self.proj(z.float())`, making the
+    first matmul Float x BFloat16. The caller swallows the RuntimeError in a
+    try/except, so L_dec silently never ran for two full training jobs. Every
+    test until now used the fp32 default and passed.
+
+    Exercises the same call the trainer makes: z pre-cast to the decoder's param
+    dtype, then forward + backward.
+    """
+    dec = _decoder().to(torch.bfloat16)
+    z = torch.randn(1, 8, 32, dtype=torch.bfloat16, requires_grad=True)
+    tgt = torch.randint(1, 64, (1, 12))
+    loss = dec(z.to(next(dec.parameters()).dtype), tgt, slot_dropout=2)
+    assert torch.isfinite(loss), loss
+    loss.backward()
+    assert z.grad is not None and z.grad.abs().sum() > 0
+    # the tripwire metric must survive the same dtype path
+    assert isinstance(dec.decode_gap(z.detach(), tgt), float)
+
+
+def test_forward_accepts_fp32_latents_against_bf16_weights():
+    """Defence in depth: even if a caller forgets the pre-cast, forward must
+    reconcile the dtypes itself rather than raise."""
+    dec = _decoder().to(torch.bfloat16)
+    z = torch.randn(1, 8, 32)          # fp32 latents, bf16 module
+    tgt = torch.randint(1, 64, (1, 12))
+    assert torch.isfinite(dec(z, tgt))
