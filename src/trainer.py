@@ -437,8 +437,16 @@ class CustomTrainerSFT_STAGE3(SFTTrainer):
         """
         Compute training loss for SFT stage3 with optional cached teacher latents.
         """
-        # Load precomputed teacher latents
-        teacher_latents = load_offline_tensor(self.teacher_latent_dir, batch_metadata=inputs['metadata'], alignment_layer=self.args.alignment_layer, rep_type="latent")
+        # Load precomputed teacher latents. Rows whose harvest failed (collate
+        # edge cases; ~0.6% in stage 2) have no target file -- run those CE-only
+        # instead of crashing a multi-hour run (same fallback as stage 2).
+        try:
+            teacher_latents = load_offline_tensor(self.teacher_latent_dir, batch_metadata=inputs['metadata'], alignment_layer=self.args.alignment_layer, rep_type="latent")
+        except RuntimeError as e:
+            self._missing_targets = getattr(self, '_missing_targets', 0) + 1
+            if self._missing_targets <= 5 or self._missing_targets % 100 == 0:
+                logging.warning(f"stage-3 target latents missing (#{self._missing_targets}); CE-only step. {e}")
+            teacher_latents = None
 
         # Recentered alignment (mod A): subtract the dataset-mean target latent so
         # the cosine budget goes to the content subspace, not the shared mean.
@@ -489,7 +497,7 @@ class CustomTrainerSFT_STAGE3(SFTTrainer):
         inputs['ce_emphasize_factor'] = self.ce_emphasize_factor
         inputs['ce_emphasize_poss'] = inputs['observation_poss']
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        inputs['loss_type'] = ['ce', 'alignment']
+        inputs['loss_type'] = ['ce', 'alignment'] if teacher_latents is not None else ['ce']
         inputs['compute_emphasize_acc'] = True
         if 'student_attention_mask_4d' in inputs:
             inputs['attention_mask_4d'] = inputs.pop('student_attention_mask_4d')
