@@ -83,6 +83,11 @@ def get_args():
                         help="target answer-NLL gap donor-vs-real (nats): the causality dial. "
                              "Small (0.1-0.2) preserves accuracy for a modest do(Z).")
     parser.add_argument("--swap_every", type=int, default=1, help="compute L_swap every N steps (cost knob).")
+    parser.add_argument("--swap_span", type=str, default="obs", choices=["obs", "answer", "both"],
+                        help="Span L_swap is supervised on. 'obs' = original design; 'answer' = "
+                             "the reasoning+answer tokens where do(Z) is actually measured "
+                             "(nll_real is detached, so a confident answer still gives gradient "
+                             "through nll_donor); 'both' = union.")
     parser.add_argument("--swap_bank", type=int, default=64, help="donor ring-buffer size.")
     parser.add_argument("--no_aux_images", action='store_true', default=False,
                         help="precompute_teacher_reps.py only: run the teacher WITHOUT auxiliary "

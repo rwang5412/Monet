@@ -70,6 +70,9 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
         self.swap_weight = float(getattr(self.args, 'swap_weight', 0.0))
         self.swap_margin = float(getattr(self.args, 'swap_margin', 0.15))
         self.swap_every = int(getattr(self.args, 'swap_every', 1))
+        # Which span L_swap is supervised on: 'obs' (default, original design),
+        # 'answer' (where do(Z) is actually measured), or 'both'.
+        self.swap_span = str(getattr(self.args, 'swap_span', 'obs'))
         self._bank = DonorBank(size=int(getattr(self.args, 'swap_bank', 64)))
         self._dec_loss_cum = self._dec_gap_cum = 0.0
         self._dec_steps = 0
@@ -99,6 +102,33 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
         # read the student key here.
         L = inputs['student_input_ids'][0].numel()
         return [p for p in obs_poss if 0 < p < L]
+
+    def _answer_positions(self, inputs):
+        """Labeled response positions that are NOT observation tokens (reasoning +
+        final answer).
+
+        do(Z) is an ANSWER-level measurement, so this is the span the causality
+        claim actually lives on. The original design supervised L_swap on
+        observations only, reasoning that teacher-forced answer NLL (~0.11) is too
+        small to give gradient -- but nll_real is detached and the gradient flows
+        through nll_donor, which is free to rise however confident the model is.
+        A small nll_real lowers the margin TARGET; it does not remove the signal.
+        """
+        labels = inputs.get('student_labels', inputs.get('labels'))
+        if labels is None:
+            return None
+        L = inputs['student_input_ids'][0].numel()
+        obs = set(self._obs_positions(inputs) or [])
+        lab = (labels[0] != -100).nonzero(as_tuple=False).flatten().tolist()
+        return [p for p in lab if 0 < p < L and p not in obs]
+
+    def _swap_positions(self, inputs, obs_pos):
+        """Span L_swap is supervised on, per --swap_span."""
+        if self.swap_span == 'answer':
+            return self._answer_positions(inputs)
+        if self.swap_span == 'both':
+            return sorted(set((obs_pos or []) + (self._answer_positions(inputs) or [])))
+        return obs_pos
 
     def _answer_key(self, inputs):
         """A cheap key for 'same final answer': the tail labeled token ids. Used to
@@ -167,9 +197,10 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
                         f"FAILED on all {self._dec_err} attempts -- the writer lever is "
                         f"dead, so this run cannot test it. Last error: {e!r}") from e
 
-        # ---- L_swap: reader-side redirect (different-answer donor, obs span) ----
+        # ---- L_swap: reader-side redirect (different-answer donor) ----
         step = int(getattr(self.state, 'global_step', 0) or 0)
-        if (self.swap_weight > 0 and z is not None and obs_pos
+        swap_pos = self._swap_positions(inputs, obs_pos)
+        if (self.swap_weight > 0 and z is not None and swap_pos
                 and 'ce_patch_pos' in inputs and (step % max(1, self.swap_every) == 0)):
             try:
                 zt = z if z.dim() == 2 else z[0]
@@ -177,8 +208,8 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
                 if donor is not None:
                     donor = donor.to(zt.device, zt.dtype)
                     with torch.no_grad():
-                        nll_real = self._span_nll(model, inputs, zt, obs_pos)
-                    nll_donor = self._span_nll(model, inputs, donor, obs_pos)
+                        nll_real = self._span_nll(model, inputs, zt, swap_pos)
+                    nll_donor = self._span_nll(model, inputs, donor, swap_pos)
                     # push nll_donor UP toward nll_real + margin (nll_real detached)
                     l_swap = F.relu(self.swap_margin - (nll_donor - nll_real.detach()))
                     loss = loss + self.swap_weight * l_swap

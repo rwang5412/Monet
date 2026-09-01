@@ -463,6 +463,7 @@ elif args.stage in ['sft_stage2','sft_stage3']:
     setattr(training_args, 'swap_weight', getattr(args, 'swap_weight', 0.0))
     setattr(training_args, 'swap_margin', getattr(args, 'swap_margin', 0.15))
     setattr(training_args, 'swap_every', getattr(args, 'swap_every', 1))
+    setattr(training_args, 'swap_span', getattr(args, 'swap_span', 'obs'))
     setattr(training_args, 'swap_bank', getattr(args, 'swap_bank', 64))
 
 # Initialize the trainer (callbacks that need trainer instance will be added after)
