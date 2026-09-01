@@ -244,7 +244,18 @@ def affine_subspace_alignment_loss(
 def alignment_loss(teacher_hidden_states: torch.Tensor, student_hidden_states: Union[List[torch.Tensor], torch.Tensor]):
     total_loss = 0
     if teacher_hidden_states.dim() == 3: # [num_layer, num_align_in_a_seg, dim], align all layers
-        total_loss = (1 - torch.nn.functional.cosine_similarity(teacher_hidden_states.to(student_hidden_states.device, student_hidden_states.dtype), student_hidden_states)).mean()
+        # dim=-1 is LOAD-BEARING. F.cosine_similarity defaults to dim=1, which on
+        # these [num_layer, K, dim] tensors is the SLOT axis: it would cosine the
+        # length-K across-slot profile for every (layer, feature) pair instead of
+        # the length-3584 content vector. That objective is invariant to the
+        # latent content it is meant to distill, and it actively REWARDS the 8
+        # slots sharing a profile -- i.e. the within-block redundancy (0.925)
+        # that L_dec exists to break. Inherited from upstream; the sibling
+        # obs_residual_loss passes dim=-1 explicitly and the dim()==1 branch
+        # below passes 0 explicitly, so the default was never intended here.
+        total_loss = (1 - torch.nn.functional.cosine_similarity(
+            teacher_hidden_states.to(student_hidden_states.device, student_hidden_states.dtype),
+            student_hidden_states, dim=-1)).mean()
     elif teacher_hidden_states.dim() == 1: # align last layer
         total_loss = 1 - torch.nn.functional.cosine_similarity(student_hidden_states, teacher_hidden_states, 0)
     return total_loss

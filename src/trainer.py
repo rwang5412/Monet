@@ -519,7 +519,14 @@ class CustomTrainerSFT_STAGE3(SFTTrainer):
         if getattr(student_outputs, 'mean_emphasize_acc', None) is not None:
             self.observation_token_acc += getattr(student_outputs, 'mean_emphasize_acc')
             self.observation_token_acc_step += 1
-        alignment_loss = student_outputs.loss_dict['alignment']
+        # .get with a tensor default: on a row whose target file is missing we set
+        # loss_type=['ce'] above, so the modeling never populates 'alignment' and a
+        # bare [] lookup would raise KeyError -- turning the CE-only fallback into
+        # a different crash instead of a fallback. (Stage 2 already does this.)
+        alignment_loss = student_outputs.loss_dict.get('alignment', None)
+        if not isinstance(alignment_loss, torch.Tensor):
+            alignment_loss = torch.tensor(float(alignment_loss or 0.0),
+                                          device=student_ce_loss.device)
         loss = student_ce_loss + self.alignment_weight * alignment_loss
         outputs_student_loss = student_ce_loss.item()
 

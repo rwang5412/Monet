@@ -80,6 +80,10 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
         self._swap_loss_cum = self._swap_gap_cum = 0.0
         self._swap_steps = 0
         self._swap_ok_total = 0  # cumulative successes (log() resets _swap_steps)
+        self._dec_gap_donor = 0  # decode_gap comparisons that used a REAL donor
+        self._log_window = 0     # compute_loss calls since the last log() flush
+        self._cl_calls = 0       # total compute_loss calls (fail-loud horizon)
+        self._dec_last_err = self._swap_last_err = None
 
     def _obs_target_ids(self, inputs):
         obs_poss = inputs.get('observation_poss', [None])[0]
@@ -181,6 +185,7 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
                                        zt[0].shape, ans_key)
                 self._dec_gap_cum += dec.decode_gap(
                     zt.detach(), tgt, donor=None if _don is None else _don.unsqueeze(0))
+                self._dec_gap_donor += (1 if _don is not None else 0)
                 self._dec_steps += 1
                 self._dec_ok_total += 1
             except Exception as e:
@@ -191,11 +196,7 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
                 # objective: a bf16 dtype error was swallowed here for two entire
                 # training jobs (15237561, 15427523) -- L_dec contributed nothing
                 # and the logs showed no decode_loss key to notice it by.
-                if self._dec_ok_total == 0 and self._dec_err >= 50:
-                    raise RuntimeError(
-                        f"L_dec is enabled (decode_weight={self.decode_weight}) but has "
-                        f"FAILED on all {self._dec_err} attempts -- the writer lever is "
-                        f"dead, so this run cannot test it. Last error: {e!r}") from e
+                self._dec_last_err = repr(e)
 
         # ---- L_swap: reader-side redirect (different-answer donor) ----
         step = int(getattr(self.state, 'global_step', 0) or 0)
@@ -224,30 +225,70 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
                     logging.warning(f"L_swap skipped: {e!r}")
                 # Same fail-loud rule as L_dec: a sporadic bad row is fine, an
                 # objective that has NEVER once contributed is a dead run.
-                if self._swap_ok_total == 0 and self._swap_err >= 50:
-                    raise RuntimeError(
-                        f"L_swap is enabled (swap_weight={self.swap_weight}) but has FAILED "
-                        f"on all {self._swap_err} attempts -- the reader lever is dead. "
-                        f"Last error: {e!r}") from e
+                self._swap_last_err = repr(e)
         elif self.swap_weight > 0 and z is not None:
             self._bank.push(z if z.dim() == 2 else z[0], ans_key)
 
+        # ---- fail-loud, OUTSIDE every guard ----
+        # The old checks lived inside `if dec is not None and ...` / the donor
+        # branch, so a permanently-FALSE precondition (decoder not found by
+        # _unwrap, latents never stashed, donor bank starved) incremented no
+        # counter, raised nothing, and merely omitted the log key. That is the
+        # exact signature of the two jobs L_dec was dead in. "Never attempted"
+        # must be as loud as "always failed".
+        self._cl_calls += 1
+        self._log_window += 1
+        if self._cl_calls == 200:
+            for name, weight, ok, err, last in (
+                    ("L_dec", self.decode_weight, self._dec_ok_total,
+                     getattr(self, '_dec_err', 0), self._dec_last_err),
+                    ("L_swap", self.swap_weight, self._swap_ok_total,
+                     getattr(self, '_swap_err', 0), self._swap_last_err)):
+                if weight > 0 and ok == 0:
+                    raise RuntimeError(
+                        f"{name} is ENABLED (weight={weight}) but contributed to 0 of "
+                        f"{self._cl_calls} steps -- the objective is dead and this run "
+                        f"cannot test it. Caught errors: {err}; last: {last}. "
+                        f"(err=0 means the loss was never even attempted: check that the "
+                        f"module is attached, latents are stashed, and spans are non-empty.)")
         return (loss, None) if return_outputs else loss
 
     def log(self, logs, start_time=None):
+        """Emit every enabled objective's key UNCONDITIONALLY.
+
+        The old guards (`if self._dec_steps > 0`) meant a dead objective produced
+        no key at all, and the ABSENCE of a key was the only evidence -- which is
+        exactly how L_dec stayed dead for two full jobs. Now an enabled-but-never-
+        firing loss logs 0.0 next to a *_fired fraction, so it is visible in the
+        first log line instead of inferable from a missing dict entry.
+        """
         merged = dict(logs)
-        if self._dec_steps > 0:
-            merged["decode_loss"] = round(self._dec_loss_cum / self._dec_steps, 6)
-            merged["decode_gap"] = round(self._dec_gap_cum / self._dec_steps, 6)
+        if self.decode_weight > 0:
+            merged["decode_loss"] = (round(self._dec_loss_cum / self._dec_steps, 6)
+                                     if self._dec_steps > 0 else 0.0)
+            merged["decode_gap"] = (round(self._dec_gap_cum / self._dec_steps, 6)
+                                    if self._dec_steps > 0 else 0.0)
+            # 0.0 => L_dec is enabled but contributed NOTHING this window.
+            merged["decode_fired"] = round(self._dec_steps / max(self._log_window, 1), 3)
+            # 'donor' is the real interchange control; 'noise' is the weak
+            # fallback used when the DonorBank is empty (always so when
+            # swap_weight == 0), against which any decoder scores well.
+            merged["decode_gap_ctrl"] = ("donor" if self._dec_gap_donor > 0 else "noise")
             self._dec_loss_cum = self._dec_gap_cum = 0.0
-            self._dec_steps = 0
-        if self._swap_steps > 0:
-            merged["swap_loss"] = round(self._swap_loss_cum / self._swap_steps, 6)
+            self._dec_steps = self._dec_gap_donor = 0
+        if self.swap_weight > 0:
+            merged["swap_loss"] = (round(self._swap_loss_cum / self._swap_steps, 6)
+                                   if self._swap_steps > 0 else 0.0)
             # swap_gap = nll_donor - nll_real; this is the training-time causality
             # signal we want to see RISE toward swap_margin (do(Z) proxy).
-            merged["swap_gap"] = round(self._swap_gap_cum / self._swap_steps, 6)
+            merged["swap_gap"] = (round(self._swap_gap_cum / self._swap_steps, 6)
+                                  if self._swap_steps > 0 else 0.0)
+            # 0.0 => enabled but never fired (e.g. the donor bank never yields a
+            # same-shape different-answer block, which raises no exception).
+            merged["swap_fired"] = round(self._swap_steps / max(self._log_window, 1), 3)
             self._swap_loss_cum = self._swap_gap_cum = 0.0
             self._swap_steps = 0
+        self._log_window = 0
         return super().log(merged, start_time)
 
 
