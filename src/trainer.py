@@ -258,6 +258,13 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
             )
 
         alignment_loss = teacher_output.loss_dict.get('alignment', torch.tensor(0.0))
+        # The modeling block initialises its accumulator as a Python float and can
+        # return it unchanged when every sample in the batch hits the obs-count
+        # mismatch `continue`. At bsz=1 that is one bad row, and the .item() below
+        # would then raise AttributeError -- the "don't kill a multi-day run"
+        # guard killing the run. Normalise to a tensor.
+        if not isinstance(alignment_loss, torch.Tensor):
+            alignment_loss = torch.tensor(float(alignment_loss), device=teacher_ce_loss.device)
 
         # Change 2 (latent grounding InfoNCE). Two calls: the writer-routed one
         # feeds the latent-only surrogate (gradient reaches model params ONLY
@@ -359,7 +366,12 @@ class CustomTrainerSFT_STAGE2(SFTTrainer):
             # direct mode: one backprop through everything; grounding_writer's
             # graph already includes the projector, so grounding_proj is NOT
             # added (it would double-count the projector gradient).
-            loss = teacher_ce_loss + latent_routed
+            # emphasize_latent_weight scales the aux (latent-routed) terms here
+            # exactly as it scales the surrogate above -- without this the flag
+            # was silently a no-op in every DeepSpeed run, so the paper's 2.0
+            # ran the aux losses at 1x.
+            _elw = float(getattr(self.args, 'emphasize_latent_weight', 1.0) or 1.0)
+            loss = teacher_ce_loss + _elw * latent_routed
 
         if getattr(teacher_output, 'mean_emphasize_acc', None) is not None:
             self.observation_token_acc += getattr(teacher_output, 'mean_emphasize_acc')
