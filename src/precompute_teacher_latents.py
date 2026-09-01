@@ -129,7 +129,17 @@ def collate_fn_precompute_teacher_latents(examples):
     
     image_inputs, _ = process_vision_info(examples)
     if args.image_resize == "global":
-        image_inputs, new_sizes = resize_by_token_budget(image_inputs, global_max_pixels=1000*28*28, per_img_max_pixels=500*28*28)
+        # Use the SAME budget Stage-2 trained at (defaults 1500/1280), not a
+        # hardcoded 1000/500. The harvest runs the Stage-2 checkpoint in its
+        # Stage-2 configuration, so a different budget makes it produce target
+        # latents at a resolution it never trained on -- and the Stage-3 student
+        # that must match those targets sees the question image at a third budget
+        # (sft_stage3_img_tokens, default 2000). The slot-count assert cannot
+        # catch this.
+        image_inputs, new_sizes = resize_by_token_budget(
+            image_inputs,
+            global_max_pixels=args.sft_stage2_global_img_tokens * 28 * 28,
+            per_img_max_pixels=args.sft_stage2_per_img_tokens * 28 * 28)
     elif args.image_resize == "clear_question_img":
         image_inputs, new_sizes = resize_diff(image_inputs)
 
