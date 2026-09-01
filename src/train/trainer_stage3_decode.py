@@ -76,6 +76,7 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
         self._dec_ok_total = 0   # cumulative successes (log() resets _dec_steps)
         self._swap_loss_cum = self._swap_gap_cum = 0.0
         self._swap_steps = 0
+        self._swap_ok_total = 0  # cumulative successes (log() resets _swap_steps)
 
     def _obs_target_ids(self, inputs):
         obs_poss = inputs.get('observation_poss', [None])[0]
@@ -178,11 +179,19 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
                     self._swap_loss_cum += float(l_swap.detach().item())
                     self._swap_gap_cum += float((nll_donor - nll_real).detach().item())
                     self._swap_steps += 1
+                    self._swap_ok_total += 1
                 self._bank.push(zt, ans_key)
             except Exception as e:
-                if getattr(self, '_swap_err', 0) < 5:
-                    self._swap_err = getattr(self, '_swap_err', 0) + 1
+                self._swap_err = getattr(self, '_swap_err', 0) + 1
+                if self._swap_err <= 5:
                     logging.warning(f"L_swap skipped: {e!r}")
+                # Same fail-loud rule as L_dec: a sporadic bad row is fine, an
+                # objective that has NEVER once contributed is a dead run.
+                if self._swap_ok_total == 0 and self._swap_err >= 50:
+                    raise RuntimeError(
+                        f"L_swap is enabled (swap_weight={self.swap_weight}) but has FAILED "
+                        f"on all {self._swap_err} attempts -- the reader lever is dead. "
+                        f"Last error: {e!r}") from e
         elif self.swap_weight > 0 and z is not None:
             self._bank.push(z if z.dim() == 2 else z[0], ans_key)
 
