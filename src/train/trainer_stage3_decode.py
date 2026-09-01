@@ -144,7 +144,13 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
                             slot_dropout=self.slot_dropout)
                 loss = loss + self.decode_weight * l_dec
                 self._dec_loss_cum += float(l_dec.detach().item())
-                self._dec_gap_cum += dec.decode_gap(zt.detach(), tgt)
+                # Real other-sample latents make the best comparison Z; the bank
+                # is empty for the first few steps, and decode_gap falls back to
+                # matched-moment noise then (bsz=1 has no in-batch alternative).
+                _don = self._bank.draw(int(getattr(self.state, 'global_step', 0) or 0),
+                                       zt[0].shape, ans_key)
+                self._dec_gap_cum += dec.decode_gap(
+                    zt.detach(), tgt, donor=None if _don is None else _don.unsqueeze(0))
                 self._dec_steps += 1
                 self._dec_ok_total += 1
             except Exception as e:

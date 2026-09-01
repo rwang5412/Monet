@@ -112,3 +112,28 @@ def test_forward_accepts_fp32_latents_against_bf16_weights():
     z = torch.randn(1, 8, 32)          # fp32 latents, bf16 module
     tgt = torch.randint(1, 64, (1, 12))
     assert torch.isfinite(dec(z, tgt))
+
+
+def test_decode_gap_is_nonzero_at_batch_size_one():
+    """REGRESSION (jobs 15237561/15427523/15439209 logged decode_gap == 0.0):
+    stage 3 trains at bsz=1, where torch.roll(z, 1, dims=0) is a no-op, so the
+    'shuffled' comparison was the SAME tensor and the tripwire read nothing."""
+    dec = _decoder()
+    torch.manual_seed(0)
+    z = torch.randn(1, 8, 32)
+    tgt = torch.randint(1, 64, (1, 12))
+    gap = dec.decode_gap(z, tgt)
+    assert isinstance(gap, float) and gap != 0.0, \
+        f"decode_gap degenerate at B=1 (got {gap}); the tripwire cannot detect prior-writing"
+
+
+def test_decode_gap_uses_explicit_donor():
+    """A real other-sample latent block is the preferred comparison Z."""
+    dec = _decoder()
+    torch.manual_seed(1)
+    z = torch.randn(1, 8, 32)
+    donor = torch.randn(1, 8, 32)
+    tgt = torch.randint(1, 64, (1, 12))
+    assert dec.decode_gap(z, tgt, donor=donor) != 0.0
+    # a wrong-shaped donor must fall back, not raise
+    assert isinstance(dec.decode_gap(z, tgt, donor=torch.randn(1, 4, 32)), float)

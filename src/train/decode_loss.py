@@ -104,10 +104,29 @@ class LatentObsDecoder(nn.Module):
         return loss
 
     @torch.no_grad()
-    def decode_gap(self, z: torch.Tensor, target_ids: torch.Tensor) -> float:
-        """L_dec(shuffled Z) − L_dec(real Z). Near zero ⇒ the decoder is writing
-        from language priors and the writer objective is a no-op. Shuffle is a
-        batch roll (deterministic — no RNG) so it works at B=2 (row+twin)."""
+    def decode_gap(self, z: torch.Tensor, target_ids: torch.Tensor,
+                   donor: Optional[torch.Tensor] = None) -> float:
+        """L_dec(other Z) − L_dec(real Z). Near zero ⇒ the decoder is writing from
+        language priors and the writer objective is a no-op.
+
+        The comparison Z is, in order of preference: an explicit `donor` (a real
+        other-sample latent block — the interchange-style control), a batch roll
+        (B>1), or matched-moment noise.
+
+        B=1 CAVEAT (this shipped broken in jobs 15237561/15427523/15439209):
+        Stage 3 trains at bsz=1, where `torch.roll(z, 1, dims=0)` on a size-1 axis
+        is a NO-OP, so the gap was identically 0.0 and the tripwire read nothing.
+        Shuffling slots instead is also a no-op here: cross-attention over the
+        memory carries no positional encoding, so the decoder is permutation-
+        invariant across the K slots.
+        """
         real = self.forward(z, target_ids).item()
-        rolled = self.forward(torch.roll(z, shifts=1, dims=0), target_ids).item()
-        return rolled - real
+        alt = None
+        if donor is not None:
+            alt = donor.to(z.device, z.dtype)
+            if alt.shape != z.shape:
+                alt = None
+        if alt is None:
+            alt = (torch.roll(z, shifts=1, dims=0) if z.shape[0] > 1
+                   else torch.randn_like(z) * z.std() + z.mean())
+        return self.forward(alt, target_ids).item() - real
