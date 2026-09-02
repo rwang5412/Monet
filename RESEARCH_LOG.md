@@ -140,6 +140,44 @@ pilot was the visible symptom of real degradation.
 
 ---
 
+### Stage 2 v3 (recentered) — job 15440094, COMPLETED 10h03m
+
+Config: `RECENTER_PATH` on, `MARGIN=0.10`, `ALIGNMENT_WEIGHT=8.0`,
+`EMPHASIZE_LATENT_WEIGHT=1.0`, `EPOCHS=1`. Code `681b7f2` (contains `188fc34`).
+Checkpoint: `/scratch/haizhow/monet_ckpts/sft_stage2_residual0.10rc_ground1.0_latent8`.
+
+| training metric | v2 (failed gate) | v3 |
+|---|---|---|
+| residual_gap | +0.058 | **+0.075** |
+| hinge_active_frac | 0.496 | **0.698** |
+| within_block_sim | 0.938 | **0.722** |
+| cross_sample_sim | 0.867 | **0.824** |
+| nce_top1 | 0.674 | **0.706** |
+| teacher_ce | 0.857 | 1.358 (1 epoch vs 2) |
+| obs_token_acc | 0.677 | 0.664 (1 epoch vs 2) |
+
+All three fixes behaved as designed: the objective stayed unsatisfied (hinge 0.70,
+not coasting at 0.50), the gap passed the old plateau, and the residual term ran at
+`8.0 × 0.043 = 0.34` vs grounding's 2.80 — **8:1 instead of 47:1**.
+CAVEAT: v2's training log also looked healthy and still failed the gate. Only
+`content_nll_gap` decides promotion. Confound: v3 is 1 epoch, v2 was 2.
+
+Gate result: _pending_.
+
+### Stage 3 with L_dec alive — job 15439209, COMPLETED 12h01m
+
+Ckpt `sft_stage3_decode1.0_latent8_full`. **Interpretability is limited**: it ran
+with the upstream slot-axis alignment bug (§6) on targets from the FAILED v2 gate.
+Still informative about L_dec itself:
+- `decode_loss` 12.13 → **5.32** — L_dec trains (first run where it was ever live).
+- `observation_token_acc` **0.879** — the writer loss cost NO accuracy, which was
+  the main risk of `decode_weight=1.0`.
+- `swap_gap` **0.004** vs a 0.15 margin — the reader lever stayed inert, as in the
+  pilot.
+- `decode_gap` 0.0 — this run predates the tripwire fix (`0ec50fd`).
+
+---
+
 ## 6. Bug ledger — provenance matters
 
 ### Inherited from upstream Monet (verified via `git show <pre-branch>:file`)
