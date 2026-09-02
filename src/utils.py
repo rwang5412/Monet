@@ -830,7 +830,8 @@ def find_segments_1d_wo_helper_images(ids, token_ids):
 
     return S
 
-def build_4d_attn_wo_helper_images(input_ids, pad_mask, token_ids, mask_latent: bool = False):
+def build_4d_attn_wo_helper_images(input_ids, pad_mask, token_ids, mask_latent: bool = False,
+                                   observation_tokens_cannot_see_question_image: bool = False):
     """
     input_ids: LongTensor [B, L]
     pad_mask:  LongTensor/BoolTensor [B, L], 1/True for real tokens
@@ -865,7 +866,23 @@ def build_4d_attn_wo_helper_images(input_ids, pad_mask, token_ids, mask_latent: 
             continue
 
         Lb = input_ids.shape[1]
+        # Stage-3 observation masking (gate 15480729 diagnosis): with no mask the
+        # observation tokens attend the QUESTION IMAGE directly, so the LM never
+        # needs the latents -- obs NLL 0.090, presence gap only +0.171 and content
+        # gap +0.0002, versus +0.722 / +0.0175 for masked Stage 2. Stage 3 was
+        # systematically undoing what Stage 2 builds. Blocking the image columns
+        # for observation rows makes the latents the only visual route, exactly as
+        # --observation_tokens_cannot_see_question_image does in Stage 2.
+        img_cols = None
+        if observation_tokens_cannot_see_question_image:
+            img_ids = [token_ids[k] for k in ('img_pad', 'v_start', 'v_end') if k in token_ids]
+            m = torch.zeros(Lb, dtype=torch.bool)
+            for t in img_ids:
+                m |= (input_ids[b] == (t.item() if torch.is_tensor(t) else t))
+            img_cols = m.nonzero(as_tuple=False).squeeze(-1)
         for (A_idx, O_idx) in segs:
+            if img_cols is not None and img_cols.numel() and O_idx.numel():
+                allowed[b][O_idx[:, None], img_cols] = False
             if A_idx.numel():
                 # Optional: make A_i invisible to all subsequent tokens (as keys)
                 if mask_latent:

@@ -307,12 +307,14 @@ def collate_fn_sft_stage3(examples, alignment="boxed_start"):
     batch["student_input_ids"] = student_batch["input_ids"]
     batch["student_attention_mask"] = student_batch["attention_mask"]
 
-    if args.mask_latent:
+    _obs_blind = getattr(args, 'observation_tokens_cannot_see_question_image', False)
+    if args.mask_latent or _obs_blind:
         attn_mask_4d = build_4d_attn_wo_helper_images(
             input_ids=batch["student_input_ids"],
             pad_mask=batch["student_attention_mask"],
             token_ids=SPECIAL_id,
             mask_latent=getattr(args, 'mask_latent', False),
+            observation_tokens_cannot_see_question_image=_obs_blind,
         )
         batch["student_attention_mask_4d"] = {"full_attention": attn_mask_4d }
 
