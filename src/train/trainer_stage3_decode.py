@@ -81,6 +81,16 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
         self._swap_steps = 0
         self._swap_ok_total = 0  # cumulative successes (log() resets _swap_steps)
         self._dec_gap_donor = 0  # decode_gap comparisons that used a REAL donor
+        # L_swap gap bucketed by whether the question image was VISIBLE to the
+        # observation tokens this step (set by the collator under
+        # --obs_image_dropout). The visible bucket is the inference-relevant
+        # signal: at eval the image is always present, so only a gap that
+        # survives image visibility predicts a do(Z) effect. With the mask on,
+        # the gap is trivially large (latents are the only route) and teaches
+        # nothing transferable.
+        self._swap_gap_vis_cum = 0.0; self._swap_vis_steps = 0
+        self._swap_gap_msk_cum = 0.0; self._swap_msk_steps = 0
+        self._obs_masked_steps = 0
         self._log_window = 0     # compute_loss calls since the last log() flush
         self._cl_calls = 0       # total compute_loss calls (fail-loud horizon)
         self._dec_last_err = self._swap_last_err = None
@@ -160,6 +170,11 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
         return nll_on_positions(out.logits[0], inputs['input_ids'][0], positions)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Set by the stage-3 collator under --obs_image_dropout; popped so it
+        # never reaches the model forward. None => masking not in use.
+        obs_masked = inputs.pop('obs_image_masked', None)
+        if obs_masked:
+            self._obs_masked_steps += 1
         obs_ids = self._obs_target_ids(inputs)
         obs_pos = self._obs_positions(inputs)
         ans_key = self._answer_key(inputs)
@@ -215,9 +230,15 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
                     l_swap = F.relu(self.swap_margin - (nll_donor - nll_real.detach()))
                     loss = loss + self.swap_weight * l_swap
                     self._swap_loss_cum += float(l_swap.detach().item())
-                    self._swap_gap_cum += float((nll_donor - nll_real).detach().item())
+                    _g = float((nll_donor - nll_real).detach().item())
+                    self._swap_gap_cum += _g
                     self._swap_steps += 1
                     self._swap_ok_total += 1
+                    if obs_masked is not None:
+                        if obs_masked:
+                            self._swap_gap_msk_cum += _g; self._swap_msk_steps += 1
+                        else:
+                            self._swap_gap_vis_cum += _g; self._swap_vis_steps += 1
                 self._bank.push(zt, ans_key)
             except Exception as e:
                 self._swap_err = getattr(self, '_swap_err', 0) + 1
@@ -288,6 +309,18 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
             merged["swap_fired"] = round(self._swap_steps / max(self._log_window, 1), 3)
             self._swap_loss_cum = self._swap_gap_cum = 0.0
             self._swap_steps = 0
+        # Bucketed by image visibility -- only present under --obs_image_dropout.
+        # swap_gap_visible is THE number: causality the model keeps when it can
+        # see the image, i.e. what do(Z) will measure. swap_gap_masked should be
+        # large and is not evidence of anything transferable.
+        if self._swap_vis_steps + self._swap_msk_steps + self._obs_masked_steps > 0:
+            merged["swap_gap_visible"] = (round(self._swap_gap_vis_cum / self._swap_vis_steps, 6)
+                                          if self._swap_vis_steps > 0 else 0.0)
+            merged["swap_gap_masked"] = (round(self._swap_gap_msk_cum / self._swap_msk_steps, 6)
+                                         if self._swap_msk_steps > 0 else 0.0)
+            merged["obs_masked_frac"] = round(self._obs_masked_steps / max(self._log_window, 1), 3)
+            self._swap_gap_vis_cum = self._swap_gap_msk_cum = 0.0
+            self._swap_vis_steps = self._swap_msk_steps = self._obs_masked_steps = 0
         self._log_window = 0
         return super().log(merged, start_time)
 

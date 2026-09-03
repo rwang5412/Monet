@@ -28,6 +28,16 @@ CE_EMPHASIZE_FACTOR="${CE_EMPHASIZE_FACTOR:-4.0}"
 DECODE_WEIGHT="${DECODE_WEIGHT:-1.0}"        # writer-side redundancy breaker
 SWAP_WEIGHT="${SWAP_WEIGHT:-0.2}"            # reader-side redirect; LOW to preserve accuracy
 SWAP_MARGIN="${SWAP_MARGIN:-0.15}"           # causality dial (nats); target modest do(Z)
+# Image masking for the observation tokens (gate 15480729: unmasked stage 3 read
+# NOTHING from rank-98 latents -- obs tokens see the question image directly).
+#   OBS_IMAGE_DROPOUT=p  blind them with prob p per step (modality dropout):
+#                        masked steps teach READING the latents, visible steps
+#                        keep the image path/accuracy and let L_swap teach
+#                        PREFERRING them. Logged as swap_gap_visible/_masked.
+#   OBS_MASK=1           always blind (== p=1.0; stage-2 parity, but nothing
+#                        transfers to an inference where the image is visible).
+OBS_IMAGE_DROPOUT="${OBS_IMAGE_DROPOUT:-0.0}"
+OBS_MASK_ARG=""; [ "${OBS_MASK:-0}" = "1" ] && OBS_MASK_ARG="--observation_tokens_cannot_see_question_image"
 EPOCHS="${EPOCHS:-1}"
 NUM_SAMPLES="${NUM_SAMPLES:-32000}"          # pilot subset; unset/large for full run
 
@@ -96,6 +106,8 @@ torchrun --nproc-per-node="${NPROC:-8}" --master-port="${PORT:-29531}" -m src.ma
   --decode_weight "$DECODE_WEIGHT" \
   --swap_weight "$SWAP_WEIGHT" \
   --swap_margin "$SWAP_MARGIN" \
+  --obs_image_dropout "$OBS_IMAGE_DROPOUT" \
+  $OBS_MASK_ARG \
   $RECENTER_ARG \
   --num_samples "$NUM_SAMPLES" \
   ${WANDB_NAME:+--wandb_name "$WANDB_NAME"}

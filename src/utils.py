@@ -125,6 +125,13 @@ def get_args():
     # ==== Custom attention =====
     parser.add_argument("--not_use_4d", action='store_true', default=False)
     parser.add_argument("--not_mask_image", action='store_true', default=False)
+    parser.add_argument("--obs_image_dropout", type=float, default=0.0,
+                        help="Stage 3: per-step probability that observation tokens are blinded "
+                             "to the question image (modality dropout). Masked steps teach the LM "
+                             "to READ the latents (only visual route); visible steps preserve the "
+                             "image path and accuracy, and are where L_swap teaches it to PREFER "
+                             "the latents. 0 = off; --observation_tokens_cannot_see_question_image "
+                             "is the always-on (p=1) form.")
     parser.add_argument("--mask_latent", action='store_true', default=False,
                         help="If set, make latent tokens (A_i) invisible to all subsequent tokens in build_additive_bias.")
     parser.add_argument("--observation_tokens_only_see_image_tokens", action='store_true', default=False)

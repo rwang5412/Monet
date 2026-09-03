@@ -308,15 +308,26 @@ def collate_fn_sft_stage3(examples, alignment="boxed_start"):
     batch["student_attention_mask"] = student_batch["attention_mask"]
 
     _obs_blind = getattr(args, 'observation_tokens_cannot_see_question_image', False)
-    if args.mask_latent or _obs_blind:
+    # Stochastic image masking (--obs_image_dropout p): each step, with prob p the
+    # observation tokens are blinded to the question image. Masked steps teach the
+    # model to READ the latents (they are the only visual route); visible steps
+    # keep the image path -- and the accuracy -- intact, and are where L_swap
+    # teaches it to PREFER latents even when the image is available. The always-on
+    # flag is p=1. The per-step outcome is recorded so the trainer can bucket the
+    # swap gap by image visibility (swap_gap_visible is the inference-relevant one).
+    _p = float(getattr(args, 'obs_image_dropout', 0.0) or 0.0)
+    _blind_now = bool(_obs_blind or (_p > 0 and random.random() < _p))
+    if args.mask_latent or _blind_now:
         attn_mask_4d = build_4d_attn_wo_helper_images(
             input_ids=batch["student_input_ids"],
             pad_mask=batch["student_attention_mask"],
             token_ids=SPECIAL_id,
             mask_latent=getattr(args, 'mask_latent', False),
-            observation_tokens_cannot_see_question_image=_obs_blind,
+            observation_tokens_cannot_see_question_image=_blind_now,
         )
         batch["student_attention_mask_4d"] = {"full_attention": attn_mask_4d }
+    if _obs_blind or _p > 0:
+        batch["obs_image_masked"] = _blind_now
 
     batch["student_alignment_poss"] = find_ids_poss(batch["student_input_ids"], answer_start_pattern, latent_pad_idx)
 

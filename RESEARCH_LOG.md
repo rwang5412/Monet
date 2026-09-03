@@ -340,6 +340,42 @@ than plateauing; `hinge_active_frac` should stay ≥0.8 rather than falling to 0
 
 ---
 
+## 9b. Stage 3 v2 design — making causality survive a visible image (2026-09-03)
+
+Analysis after gates 15478460/15480729: every fix so far makes latents
+*informative* and makes the model *read them when the image is hidden*. Nothing
+trains it to PREFER latents when the image is available -- and do(Z) is measured
+with the image present. That train/test gap is the mechanism by which released
+Monet gets guard 1.000 / Δ 0.0: it re-derives the answer from the image.
+
+Even the best stage 2 is ~40:1 presence:content (the model cares 40× more that
+latents exist than what they say). The 0.02 gate floor is "not a rounding error",
+not "sufficient for a behavior change".
+
+Implemented (commit after 960c179):
+- `--obs_image_dropout p` — stochastic modality dropout in the stage-3 collator.
+  With prob p per step, observation tokens are blinded to the question image
+  (masked steps teach READING the latents -- only visual route); otherwise the
+  image is visible (keeps the accuracy path, and is where L_swap can teach
+  PREFERRING the latents). `--observation_tokens_cannot_see_question_image` is
+  the p=1 form. Collator records `batch['obs_image_masked']`.
+- L_swap gap bucketed by image visibility: `swap_gap_visible` (THE number --
+  causality kept when the image is visible; predicts do(Z)), `swap_gap_masked`
+  (trivially large; not transferable), `obs_masked_frac`.
+- Launcher env: `OBS_IMAGE_DROPOUT`, `OBS_MASK=1`.
+
+Planned launch once stage 2 v4 passes its gate and targets are re-harvested:
+`OBS_IMAGE_DROPOUT=0.5 SWAP_WEIGHT=1.0` (swap was inert at 0.2 twice; with the
+image visible half the time the hinge is active and actually teaches preference).
+Success signal during training: `swap_gap_visible` rising from ~0 toward the
+margin while `observation_token_acc` holds ~0.88.
+
+Structural caveat still open: on V* at max_pixels 8192·28² the image contains
+the answer, so a rational model needs no latents. Cheap diagnostic: run do(Z)
+at reduced max_pixels on the existing stage-3 ckpt -- if Δ goes negative when
+the image is degraded, latents are load-bearing exactly when needed (Monet's
+actual claim); if it stays 0 the reader isn't using them at all.
+
 ## 10. Open questions
 
 1. Does removing the shortcut + raising the margin/weight actually lift the
