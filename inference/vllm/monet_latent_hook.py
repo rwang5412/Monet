@@ -15,6 +15,13 @@ This module wraps exactly that tensor so we can, at *real generation* time:
                     the paper's ``identical`` intervention).
   * ``corrupt_gauss`` -- replace every latent with a fresh draw N(mu, sigma)
                     (destroy; the paper's ``gauss_replace`` intervention).
+  * ``swap``     -- replace every latent with a REAL latent from a DIFFERENT
+                    sample (the pool saved by a ``capture`` pass with
+                    MONET_LATENT_DUMP set). On-manifold, slot-aligned: this is
+                    the intervention stage-3 L_swap trains against (donor
+                    latents), so it is the do(Z) mode that measures what was
+                    trained. mean/gauss are off-manifold and a reader trained on
+                    donors need not react to them the same way.
 
 All corruptions are matched to the empirical latent mu/sigma so there is no
 out-of-distribution embedding shock -- an accuracy drop reflects *lost latent
@@ -23,9 +30,13 @@ information*, not a foreign vector confusing the model.
 Everything is configured through environment variables so it survives the
 driver->worker process boundary that vLLM creates:
 
-    MONET_LATENT_MODE   off | capture | corrupt_mean | corrupt_gauss   (default off)
+    MONET_LATENT_MODE   off | capture | corrupt_mean | corrupt_gauss | swap   (default off)
     MONET_LATENT_STATS  path to the mu/sigma stats file (.pt)
     MONET_LATENT_SEED   int seed for the gaussian corruption (default 0)
+    MONET_LATENT_POOL   swap: the [N, H] latent pool from the capture pass
+                        (defaults to MONET_LATENT_DUMP)
+    LATENT_SIZE         swap: K, latents per block -- the pool offset is a multiple
+                        of K so slot k receives another sample's slot k
 
 When the mode is ``off`` (the default, no env set) the hook is a pass-through and
 the runner behaves exactly as before.
@@ -40,7 +51,8 @@ MODE_OFF = "off"
 MODE_CAPTURE = "capture"
 MODE_MEAN = "corrupt_mean"
 MODE_GAUSS = "corrupt_gauss"
-_VALID_MODES = {MODE_OFF, MODE_CAPTURE, MODE_MEAN, MODE_GAUSS}
+MODE_SWAP = "swap"
+_VALID_MODES = {MODE_OFF, MODE_CAPTURE, MODE_MEAN, MODE_GAUSS, MODE_SWAP}
 
 # Dump the running stats to disk every this many captured latents. The final
 # partial window (< this) is dropped, which is negligible for mu/sigma.
@@ -80,9 +92,15 @@ class MonetLatentHook:
         self._mu: Optional[torch.Tensor] = None        # [H]
         self._sigma: Optional[torch.Tensor] = None     # [H]
         self._gen: Optional[torch.Generator] = None
+        # swap: donor pool [N, H] and a running position into it
+        self._pool: Optional[torch.Tensor] = None
+        self._pool_shift: int = 0
+        self._swap_calls: int = 0
 
         if self.mode in (MODE_MEAN, MODE_GAUSS):
             self._load_stats()
+        if self.mode == MODE_SWAP:
+            self._load_pool()
 
         print(f"[MonetLatentHook] mode={self.mode} stats={self.stats_path} "
               f"seed={self.seed} active={self.active}")
@@ -103,6 +121,29 @@ class MonetLatentHook:
         self._sigma = blob["sigma"].to(torch.float32)
         print(f"[MonetLatentHook] loaded stats: mu{tuple(self._mu.shape)} "
               f"sigma{tuple(self._sigma.shape)} from n={blob.get('count')}")
+
+    def _load_pool(self):
+        path = os.getenv("MONET_LATENT_POOL") or os.getenv("MONET_LATENT_DUMP")
+        if not path or not os.path.exists(path):
+            raise FileNotFoundError(
+                f"MONET_LATENT_MODE=swap needs a donor pool, but MONET_LATENT_POOL="
+                f"{path!r} does not exist. Run the capture pass with DUMP=1 first.")
+        pool = torch.load(path, map_location="cpu")
+        if pool.dim() != 2 or pool.shape[0] < 2:
+            raise ValueError(f"donor pool must be [N>=2, H], got {tuple(pool.shape)}")
+        k = max(1, int(os.getenv("LATENT_SIZE", "1")))
+        self._pool = pool.to(torch.float32)
+        self._pool_shift = self._donor_shift(int(pool.shape[0]), k)
+        print(f"[MonetLatentHook] loaded donor pool {tuple(pool.shape)} from {path}; "
+              f"K={k} shift={self._pool_shift}")
+
+    @staticmethod
+    def _donor_shift(n: int, k: int) -> int:
+        """Offset into the pool: about half the pool away, rounded to a multiple of
+        K so slot alignment is preserved, and never 0 (that would return the
+        sample's own latent when the pool order matches emission order)."""
+        shift = (n // 2 // k) * k
+        return shift if shift > 0 else min(k, n - 1)
 
     def _dump_stats(self):
         if not self.stats_path:
@@ -155,6 +196,15 @@ class MonetLatentHook:
                 self._dump_stats()
                 self._since_dump = 0
             return hidden  # clean pass: model is unperturbed
+
+        if self.mode == MODE_SWAP:
+            # The i-th latent emitted in this pass gets pool[(i + shift) mod N]:
+            # a real latent, from another sample, at the same slot position when
+            # emission is K-regular. Walks the whole pool, so every sample gets a
+            # different donor and no donor is reused before the pool wraps.
+            idx = (self._swap_calls + self._pool_shift) % int(self._pool.shape[0])
+            self._swap_calls += 1
+            return self._pool[idx].to(device=hidden.device, dtype=hidden.dtype)
 
         # corruption modes
         mu = self._mu.to(device=hidden.device, dtype=hidden.dtype)

@@ -42,9 +42,13 @@ touch "$VLME/.env" 2>/dev/null || true
 #   python -m evaluation.capimagine.vlmevalkit.score_doz  (see that script)
 JUDGE="${JUDGE:-exact_matching}"
 # MODES lets you run a subset, e.g. MODES=capture for a latent-collapse probe.
-MODES="${MODES:-capture corrupt_mean corrupt_gauss}"
+# `swap` = replace each latent with a REAL latent from another sample (on-manifold,
+# the intervention stage-3 L_swap trains against). It reads the pool that the
+# capture pass dumps, so DUMP is forced on whenever swap is requested.
+MODES="${MODES:-capture corrupt_mean corrupt_gauss swap}"
 # DUMP=1 -> capture also saves every individual latent vector for probe_collapse.py.
 DUMP_PT="/scratch/$USER/results/vlmeval_doz/${MODEL}_${DATA}_latents.pt"
+case " $MODES " in *" swap "*) DUMP=1;; esac
 
 cd "$VLME"
 echo "VLME=$VLME MODEL=$MODEL LATENT_SIZE=$LATENT_SIZE STATS=$STATS MODES='$MODES'"
@@ -54,6 +58,7 @@ for MODE in $MODES; do
   export MONET_LATENT_MODE="$MODE"
   export MONET_LATENT_STATS="$STATS"
   export MONET_LATENT_SEED=0
+  export MONET_LATENT_POOL="$DUMP_PT"       # swap mode's donor pool (from capture)
   if [ "$MODE" = "capture" ] && [ -n "${DUMP:-}" ]; then
     export MONET_LATENT_DUMP="$DUMP_PT"; mkdir -p "$(dirname "$DUMP_PT")"; rm -f "$DUMP_PT"
     echo "  dumping individual latents -> $DUMP_PT"

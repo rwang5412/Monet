@@ -14,9 +14,9 @@ import os
 
 import pandas as pd
 
-MODES = ["capture", "corrupt_mean", "corrupt_gauss"]
+MODES = ["capture", "corrupt_mean", "corrupt_gauss", "swap"]
 LABEL = {"capture": "clean (capture)", "corrupt_mean": "corrupt_mean",
-         "corrupt_gauss": "corrupt_gauss"}
+         "corrupt_gauss": "corrupt_gauss", "swap": "swap (donor)"}
 
 
 def _judged(vlme, mode, model, data):
