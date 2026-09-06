@@ -162,22 +162,23 @@ not coasting at 0.50), the gap passed the old plateau, and the residual term ran
 CAVEAT: v2's training log also looked healthy and still failed the gate. Only
 `content_nll_gap` decides promotion. Confound: v3 is 1 epoch, v2 was 2.
 
-**Gate (job 15478460, code `8e72db1`) — FAIL by 0.0025.** The gate prints two
-blocks: observation tokens BLINDED to the question image first (stage-2 parity),
-then image VISIBLE (the do(Z) condition; verdict is on this one).
+**Gate (job 15478460, code `8e72db1`) — FAIL by 0.0025.** NOTE: the gate log
+prints TWO result blocks; the first is the launcher's `n=3` smoke check (obs acc
+0.6667 = 2/3, eff. rank ~4 from three samples) and is meaningless — only the
+second, `n=300`, counts. The gate runs with the question image VISIBLE to the
+observation tokens (`run_cond(mask4d=None)`), i.e. the do(Z) condition.
 
-| metric | v3 masked | v3 visible | v2 visible |
-|---|---|---|---|
-| obs content gap | **+0.0596** | **+0.0175** | +0.0070 |
-| obs presence gap | −0.078 | +0.722 | +1.42 |
-| ans content gap | — | +0.0026 | −0.00002 |
-| eff. rank / cross-sim / within-block | 26.3 / 0.765 / 0.727 | | 54 / 0.837 / 0.925 |
-| obs acc real / donor / zero | | 0.892 / 0.885 / 0.714 | |
+| metric | v3 | v2 |
+|---|---|---|
+| obs content gap | **+0.0175** | +0.0070 |
+| obs presence gap | +0.722 | +1.42 |
+| ans content gap | +0.0026 | −0.00002 |
+| eff. rank / cross-sim / within-block | 26.3 / 0.765 / 0.727 | 54 / 0.837 / 0.925 |
+| obs acc real / donor / zero | 0.892 / 0.885 / 0.714 | |
 
-Reading: v3 taught the LM to read latent content 2.5× better than v2, and 3×
-over the floor when the image is hidden. With the image visible it falls just
-under the 0.02 floor — the model re-derives most of the observation from the
-image. Targets were harvested from v3 anyway (job 15501283, 3h03m, code
+Reading: v3 taught the LM to read latent content 2.5× better than v2 but lands
+just under the 0.02 floor — with the image visible the model re-derives most of
+the observation from the image. Targets were harvested from v3 anyway (job 15501283, 3h03m, code
 `e264c65`, at the corrected image budget) → `teacher_latents_v3/`, 124,165
 files; best gated writer at the time.
 
@@ -197,7 +198,7 @@ drift, so the drift is not (only) the shared-direction shortcut), nce_top1
 
 **Gate (job 15599687) — PASS, first ever:**
 
-| metric | v4 visible | v3 visible |
+| metric | v4 | v3 |
 |---|---|---|
 | obs content gap | **+0.0235** | +0.0175 |
 | obs presence gap | +1.640 | +0.722 |
@@ -211,8 +212,9 @@ drift, so the drift is not (only) the shared-direction shortcut), nce_top1
 Caveats: (a) ans content gap 0.0042 is the best ever and still ~20× too small
 to flip answers by itself — the 2-5% do(Z) must come from the stage-3 reader
 lever; (b) obs NLL real 1.01 vs 0.38 and obs acc 0.76 vs 0.89 on the same rows:
-`ALIGNMENT_WEIGHT=16` may have cost LM-head readout at layers 20-28 (check the
-masked block; open); (c) presence:content is 70:1 (v3 41:1) — the model
+`ALIGNMENT_WEIGHT=16` may have cost LM-head readout at layers 20-28 (open;
+the training-log obs_acc 0.674 vs v3 0.664 is under the training mask and does
+not settle it); (c) presence:content is 70:1 (v3 41:1) — the model
 leans harder on latents EXISTING than before, not proportionally on their content.
 
 Decision (2026-09-06): re-harvest from v4 → `teacher_latents_v4/` for the full
@@ -234,8 +236,8 @@ Still informative about L_dec itself:
 **Gate on this checkpoint (job 15480729):** eff. rank **98.1**, cross-sim
 **0.501**, within-block 0.676 — the most diverse, sample-specific latents in the
 project (released Monet: rank ~3, cos 0.94). L_dec WORKS as a writer fix, even
-with the slot-axis alignment bug. But the reader: obs content gap **+0.0002**
-visible / +0.0044 masked, ans content gap −0.0000, obs acc 0.979. Stage 3
+with the slot-axis alignment bug. But the reader: obs content gap **+0.0002**,
+ans content gap −0.0000, obs acc 0.979. Stage 3
 ERASED the reading v3 had taught (0.0175 → 0.0002): trained with the image
 visible and `SWAP_WEIGHT=0.2` inert, the model re-learned that the image is the
 better source. This is the mechanism behind guard 1.000 / Δ 0.0 and it will
