@@ -20,11 +20,13 @@ LM's reader doesn't USE it (obs content gap ~0). L_swap trains the reader; L_dec
 keeps the writer's slots distinct so there is something to use.
 """
 import logging
+import os
 
 import torch
 import torch.nn.functional as F
 
 from src.trainer import CustomTrainerSFT_STAGE3
+from src.aux_weights import split_aux_state_dict
 from src.train.span_nll import nll_on_positions
 
 
@@ -94,6 +96,23 @@ class CustomTrainerSFT_STAGE3_Decode(CustomTrainerSFT_STAGE3):
         self._log_window = 0     # compute_loss calls since the last log() flush
         self._cl_calls = 0       # total compute_loss calls (fail-loud horizon)
         self._dec_last_err = self._swap_last_err = None
+
+    def _save(self, output_dir=None, state_dict=None):
+        """Keep the L_dec decoder OUT of the model weights. It is training-only
+        and vLLM's strict loader rejects checkpoints that carry it (job
+        15482092: "no module or parameter named 'latent_obs_decoder'"), which
+        blocked free-gen do(Z) on the first L_dec checkpoint. Under DeepSpeed
+        save_model passes the gathered state_dict in; without it we gather here.
+        The decoder goes to a sidecar so the run stays reproducible."""
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        if state_dict is None:
+            state_dict = self.model.state_dict()
+        state_dict, aux = split_aux_state_dict(state_dict)
+        if aux:
+            os.makedirs(output_dir, exist_ok=True)
+            torch.save(aux, os.path.join(output_dir, "aux_weights.pt"))
+            logging.info(f"save: {len(aux)} training-only tensors -> aux_weights.pt (not in model weights)")
+        super()._save(output_dir, state_dict=state_dict)
 
     def _obs_target_ids(self, inputs):
         obs_poss = inputs.get('observation_poss', [None])[0]
