@@ -6,7 +6,7 @@ the project without re-deriving anything.
 
 Repo: fork `rwang5412/Monet`, branch `capimagine-harness`.
 Cluster: Palmetto (`haizhow`), scratch at `/scratch/haizhow`.
-Last updated: 2026-09-01.
+Last updated: 2026-09-06.
 
 ---
 
@@ -162,7 +162,62 @@ not coasting at 0.50), the gap passed the old plateau, and the residual term ran
 CAVEAT: v2's training log also looked healthy and still failed the gate. Only
 `content_nll_gap` decides promotion. Confound: v3 is 1 epoch, v2 was 2.
 
-Gate result: _pending_.
+**Gate (job 15478460, code `8e72db1`) — FAIL by 0.0025.** The gate prints two
+blocks: observation tokens BLINDED to the question image first (stage-2 parity),
+then image VISIBLE (the do(Z) condition; verdict is on this one).
+
+| metric | v3 masked | v3 visible | v2 visible |
+|---|---|---|---|
+| obs content gap | **+0.0596** | **+0.0175** | +0.0070 |
+| obs presence gap | −0.078 | +0.722 | +1.42 |
+| ans content gap | — | +0.0026 | −0.00002 |
+| eff. rank / cross-sim / within-block | 26.3 / 0.765 / 0.727 | | 54 / 0.837 / 0.925 |
+| obs acc real / donor / zero | | 0.892 / 0.885 / 0.714 | |
+
+Reading: v3 taught the LM to read latent content 2.5× better than v2, and 3×
+over the floor when the image is hidden. With the image visible it falls just
+under the 0.02 floor — the model re-derives most of the observation from the
+image. Targets were harvested from v3 anyway (job 15501283, 3h03m, code
+`e264c65`, at the corrected image budget) → `teacher_latents_v3/`, 124,165
+files; best gated writer at the time.
+
+### Stage 2 v4 — job 15487436, COMPLETED 19h07m, **GATE PASS**
+
+Config: `RECENTER_PATH` on, `MARGIN=0.12`, **`ALIGNMENT_WEIGHT=16.0`**,
+`EMPHASIZE_LATENT_WEIGHT=1.0`, **`EPOCHS=2`**, 8×H100. Code `e264c65`.
+Checkpoint: `/scratch/haizhow/monet_ckpts/sft_stage2_residual0.12rc_ground1.0_latent8`.
+
+Training end: residual_gap **0.117** (v3 0.075; recentered ceiling is 0.121, so
+the residual objective is SATURATED — `hinge_active_frac` 0.53 is structural,
+not v2-style coasting: half the samples have a per-sample ceiling below the
+margin), within_block_sim 0.783 (v3 0.722), cross_sample_sim 0.47 → **0.866**
+monotonic (lands exactly where v2 did, 0.867 — recentering did NOT stop the
+drift, so the drift is not (only) the shared-direction shortcut), nce_top1
+0.735, teacher_ce 0.864, obs_acc 0.674.
+
+**Gate (job 15599687) — PASS, first ever:**
+
+| metric | v4 visible | v3 visible |
+|---|---|---|
+| obs content gap | **+0.0235** | +0.0175 |
+| obs presence gap | +1.640 | +0.722 |
+| ans content gap | **+0.0042** | +0.0026 |
+| ans presence gap | +0.231 | +0.110 |
+| eff. rank / cross-sim / within-block | 28.0 / 0.812 / 0.805 | 26.3 / 0.765 / 0.727 |
+| obs acc real / donor / zero | 0.760 / 0.750 / 0.511 | 0.892 / 0.885 / 0.714 |
+| obs NLL real | **1.009** | 0.375 |
+| s_pos − s_neg | +0.072 | +0.084 |
+
+Caveats: (a) ans content gap 0.0042 is the best ever and still ~20× too small
+to flip answers by itself — the 2-5% do(Z) must come from the stage-3 reader
+lever; (b) obs NLL real 1.01 vs 0.38 and obs acc 0.76 vs 0.89 on the same rows:
+`ALIGNMENT_WEIGHT=16` may have cost LM-head readout at layers 20-28 (check the
+masked block; open); (c) presence:content is 70:1 (v3 41:1) — the model
+leans harder on latents EXISTING than before, not proportionally on their content.
+
+Decision (2026-09-06): re-harvest from v4 → `teacher_latents_v4/` for the full
+stage 3; the queued stage-3 v2 PILOT stays on v3 targets (it tests the reader
+lever, and the target upgrade is second-order to that question).
 
 ### Stage 3 with L_dec alive — job 15439209, COMPLETED 12h01m
 
@@ -175,6 +230,22 @@ Still informative about L_dec itself:
 - `swap_gap` **0.004** vs a 0.15 margin — the reader lever stayed inert, as in the
   pilot.
 - `decode_gap` 0.0 — this run predates the tripwire fix (`0ec50fd`).
+
+**Gate on this checkpoint (job 15480729):** eff. rank **98.1**, cross-sim
+**0.501**, within-block 0.676 — the most diverse, sample-specific latents in the
+project (released Monet: rank ~3, cos 0.94). L_dec WORKS as a writer fix, even
+with the slot-axis alignment bug. But the reader: obs content gap **+0.0002**
+visible / +0.0044 masked, ans content gap −0.0000, obs acc 0.979. Stage 3
+ERASED the reading v3 had taught (0.0175 → 0.0002): trained with the image
+visible and `SWAP_WEIGHT=0.2` inert, the model re-learned that the image is the
+better source. This is the mechanism behind guard 1.000 / Δ 0.0 and it will
+recur in any stage-3 run without reader pressure under a visible image.
+
+**Free-gen do(Z) on this checkpoint (job 15482092) — NEVER RAN.** vLLM refused
+the checkpoint: `no module or parameter named 'latent_obs_decoder'` (see §6 ours
+#9). Repaired 2026-09-06 with `src.strip_aux_weights` (79 tensors / 381.6M
+params removed → `aux_weights.pt`); resubmitted as job 15608326. This is the
+baseline the 2-5% target is measured against.
 
 ---
 
@@ -252,6 +323,15 @@ harvested off-distribution. This is a finding about the paper, not our pipeline.
    blocks, not within one. The **gate's** within-block number is computed
    independently and is trustworthy. NOT fixed (metric quality only).
 
+9. **The L_dec decoder was saved INTO the model weights**, and vLLM's strict
+   loader refuses unknown parameters (HF `from_pretrained` only warns, so the
+   gate and harvest never noticed). Job 15482092 — the first free-gen do(Z) on
+   an L_dec checkpoint, i.e. the verdict metric — died at engine init with
+   nothing measured. Fixed: `4d3b57b` — `CustomTrainerSFT_STAGE3_Decode._save`
+   filters `latent_obs_decoder.*` out of the (DeepSpeed-gathered) state_dict into
+   an `aux_weights.pt` sidecar; `python -m src.strip_aux_weights --ckpt DIR`
+   repairs checkpoints already on disk (in place, reversible, `--dry_run`).
+
 **Pattern:** our bugs wasted GPU time (a silently dead loss burns hours and
 produces nothing); the upstream bugs matter scientifically.
 
@@ -307,38 +387,41 @@ answers.
 
 ---
 
-## 9. Current state (2026-09-01)
+## 9. Current state (2026-09-06)
 
-**Running:** stage 2 v3 — recentered, submitted with
-`RECENTER_PATH=/scratch/haizhow/monet_ckpts/residual_mean.pt MARGIN=0.10
-ALIGNMENT_WEIGHT=8.0 EMPHASIZE_LATENT_WEIGHT=1.0 EPOCHS=1`.
+**Goal restated:** a stage-3 checkpoint whose answers move by **2-5%** under
+do(Z) (latent perturbation), V* ≈ 80. Baseline Δ = 0.0 (released Monet) and,
+we expect, ≈ 0.0 for our old stage 3 (reader collapsed to 0.0002).
 
-Each flag targets one diagnosed cause: recentering kills the shortcut, `MARGIN=0.10`
-sits just under the true 0.121 recentered ceiling so the objective keeps demanding
-more, `ALIGNMENT_WEIGHT=8.0` moves the residual term from 47× weaker than
-grounding to ~3-10×, `EMPHASIZE_LATENT_WEIGHT=1.0` pins the newly-fixed flag so
-nothing else shifts, `EPOCHS=1` because 2 epochs demonstrably degraded causality.
+**Diagnosis as of today.** Writer side is solved (stage 3 + L_dec: rank 98,
+cross-sim 0.50). Reader side is the whole problem: the best stage-2 content
+gap is 0.0235 obs / 0.0042 ans, and the old stage 3 erased even that. The one
+lever that targets the reader under a VISIBLE image — L_swap with modality
+dropout (§9b) — has never been run at a weight that bites.
 
-**Cancelled:** 15439209 (stage 3 on failed-gate targets with the broken alignment
-axis), 15440018 (stage 2 launched without the margin/weight fixes).
+**In flight:**
+- 15608326 `vlmeval_doz` — free-gen do(Z) + V* on the repaired old stage-3 ckpt
+  (`Monet-S3-ours`, K=8, DUMP=1). Establishes the baseline and proves the
+  eval path end-to-end.
+- 15599688 `sft3_pilot` — **stage 3 v2 pilot**: `TARGETS=teacher_latents_v3`,
+  `OBS_IMAGE_DROPOUT=0.5 SWAP_WEIGHT=1.0 SWAP_MARGIN=0.15`, L_dec 1.0, fixed
+  alignment axis, 32K samples / 1 epoch (~2,000 steps, ~4h on H100). PENDING
+  (Resources). Success signal: `swap_gap_visible` off ~0 toward 0.15 by step
+  ~300 with `observation_token_acc` holding ~0.88 and `decode_gap` nonzero with
+  a real donor. If `swap_gap_visible` ≤ 0.01 at step 500 → kill, relaunch at
+  `SWAP_WEIGHT=3.0`.
+- (to submit) harvest from v4 → `teacher_latents_v4/`, for the full stage 3.
 
-**Artifacts on scratch:**
-- `residual_mean.pt` — μ `(9, 3584)` over 10,000 pairs. Computed from the frozen
-  teacher caches, so it does **not** need regenerating when the student retrains.
-- `teacher_reps_pos/`, `teacher_reps_neg/` — 117,895 files each.
-- `teacher_latents_modified/` — 124,166 stage-3 targets, **stale**: harvested from
-  the failed checkpoint at the wrong image budget. Must be re-harvested.
+**Artifacts on scratch:** `residual_mean.pt`; `teacher_reps_pos/neg/`;
+`teacher_latents_v3/` (124,165, from v3, correct budget); `teacher_latents_v2_stale/`
+(do not use); stage-2 ckpts `residual0.05` (v2), `residual0.10rc` (v3),
+`residual0.12rc` (v4, PROMOTED); stage-3 `decode1.0_latent8_full` (decoder
+stripped; `aux_weights.pt` alongside). NOTE: the stage-3 launcher's `TARGETS`
+default (`teacher_latents_modified`) no longer exists — always pass `TARGETS=`.
 
-**Sequence from here:** stage 2 v3 finishes (~10h) → gate it (1 GPU, <1h,
-short walltime) → only on PASS re-harvest targets (~12h, now at the corrected
-budget) → stage 3 with the fixed alignment axis → free-generation do(Z) + V*
-through VLMEvalKit.
-
-**Watch in stage 2 v3, ~1h in:** `residual_gap` should climb past 0.058 rather
-than plateauing; `hinge_active_frac` should stay ≥0.8 rather than falling to 0.5;
-`cross_sample_sim` should stay well below 0.867.
-
----
+**Sequence from here:** pilot result → gate it (both blocks) → free-gen do(Z) on
+it → if `swap_gap_visible` rose and Δ moved, full stage 3 on `teacher_latents_v4`
+with the validated `SWAP_WEIGHT` → do(Z) + V*.
 
 ## 9b. Stage 3 v2 design — making causality survive a visible image (2026-09-03)
 
