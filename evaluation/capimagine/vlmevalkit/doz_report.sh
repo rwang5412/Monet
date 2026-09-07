@@ -16,11 +16,21 @@ LOGDIR="/scratch/$USER/results/vlmeval_doz/judge_logs"
 mkdir -p "$LOGDIR"
 
 cd "$VLME"
+set -a; [ -f .env ] && . ./.env; set +a
+if [ -z "${DEEPSEEK_API_KEY:-}${OPENAI_API_KEY:-}" ]; then
+  echo "FATAL: no DEEPSEEK_API_KEY/OPENAI_API_KEY in $VLME/.env -- VLMEvalKit would silently"
+  echo "       fall back to exact matching (job logs: 'API Key: ' empty, KeyError 'choices')."; exit 1
+fi
+export PYTHONPATH="$MONET:${PYTHONPATH:-}"
 echo "Judging do(Z) passes with DeepSeek (logs -> $LOGDIR) ..."
 for MODEL in $MODELS; do
   for M in ${MODES:-capture corrupt_mean corrupt_gauss swap}; do
     [ -d "outputs/doz_$M/$MODEL" ] || continue
     printf "  %-22s %-14s ... " "$MODEL" "$M"
+    # Drop the latent-step junk tokens the runner leaks into the text; otherwise
+    # every extractor reads the stray leading letter as the answer (~chance).
+    python -m evaluation.capimagine.vlmevalkit.strip_latent_prefix \
+      "outputs/doz_$M/$MODEL/${MODEL}_${DATA}.xlsx" 2>/dev/null | tr '\n' ' ' || true
     find "outputs/doz_$M/$MODEL" -name "*_acc.csv" -o -name "*result.pkl" \
       -o -name "*result.xlsx" 2>/dev/null | xargs -r rm -f
     if python run.py --data "$DATA" --model "$MODEL" --judge deepseek-chat \
