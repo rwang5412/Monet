@@ -25,8 +25,12 @@ import re
 
 import pandas as pd
 
-# one short token (<=3 non-space chars) followed by 2+ whitespace chars
-PREFIX = re.compile(r"^\s*\S{1,3}\s{2,}")
+# One leading token (a letter, a CJK word, or -- under corruption -- a full word
+# such as "rubber"/"color"/"animal") followed by a run of 2+ whitespace chars. A
+# real answer's first word is followed by ONE space, so it is left alone; the
+# double spaces Monet leaves mid-sentence ("The scarf is  red") are not at the
+# start and are also left alone.
+PREFIX = re.compile(r"^\s*\S{1,24}\s{2,}")
 
 
 def strip_prefix(text: str) -> tuple[str, bool]:
@@ -53,6 +57,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="+", help="prediction xlsx files or globs")
     ap.add_argument("--dry_run", action="store_true")
+    ap.add_argument("--show_unmatched", action="store_true",
+                    help="print the start of every row the pattern did not match")
     a = ap.parse_args()
     files = sorted({f for p in a.paths for f in glob.glob(p, recursive=True)
                     if f.endswith(".xlsx") and not f.endswith(".raw.xlsx")
@@ -62,6 +68,12 @@ def main():
     for f in files:
         n_hit, n = process(f, a.dry_run)
         print(f"{'would strip' if a.dry_run else 'stripped':12s} {n_hit}/{n} rows  {f}")
+        if a.show_unmatched:
+            raw = f[:-5] + ".raw.xlsx"
+            d = pd.read_excel(raw if os.path.exists(raw) else f)
+            for t in d["prediction"].astype(str):
+                if not PREFIX.match(t):
+                    print("   unmatched:", repr(t[:70]))
 
 
 if __name__ == "__main__":
