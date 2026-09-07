@@ -356,6 +356,11 @@ for data_path in args.data_path:
         train_dataset = load_jsonl_dataset(data_path)
     elif data_path.endswith('.json'):
         train_dataset = load_json_dataset(data_path)
+    # Per-file tail holdout BEFORE concatenation (see --holdout_tail).
+    n_before = len(train_dataset)
+    train_dataset = drop_tail(train_dataset, getattr(args, 'holdout_tail', 0))
+    if len(train_dataset) != n_before:
+        logging.info(f"--holdout_tail: {data_path} {n_before} -> {len(train_dataset)} rows")
     all_train_dataset.extend(train_dataset[:])
 if args.shuffle_train:
     random.seed(42)
@@ -373,6 +378,15 @@ for i, sample in tqdm(enumerate(all_train_dataset[:]), desc="Collecting training
 if getattr(args, 'num_samples', -1) and args.num_samples > 0:
     train_dataset = train_dataset[:args.num_samples]
     logging.info(f"--num_samples: training on first {len(train_dataset)} processed rows; tail held out")
+# Always print the mix. Without --shuffle_train, --num_samples is a head slice of
+# the concatenation, i.e. Visual_CoT ONLY (118K one-sentence rows) -- the pilots
+# queued on 2026-09-06 would have trained on zero reasoning data.
+_mix = dataset_mix(train_dataset)
+logging.info(f"training mix ({len(train_dataset)} rows): {_mix}")
+print(f"=== TRAINING MIX ({len(train_dataset)} rows): {_mix} ===", flush=True)
+if len(_mix) == 1 and len(args.data_path) > 1:
+    logging.warning("training subset contains ONE dataset although several were given -- "
+                    "pass --shuffle_train (or drop --num_samples)")
 
 #train_dataset = [d for d in [preprocess_function(sample) for sample in all_train_dataset[:]] if d is not None]
 

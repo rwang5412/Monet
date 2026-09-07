@@ -38,8 +38,18 @@ SWAP_MARGIN="${SWAP_MARGIN:-0.15}"           # causality dial (nats); target mod
 #                        transfers to an inference where the image is visible).
 OBS_IMAGE_DROPOUT="${OBS_IMAGE_DROPOUT:-0.0}"
 OBS_MASK_ARG=""; [ "${OBS_MASK:-0}" = "1" ] && OBS_MASK_ARG="--observation_tokens_cannot_see_question_image"
+# Which span L_swap is supervised on. 95% of the mix is Visual_CoT, whose whole
+# response IS one observation sentence, so 'obs' and 'both' coincide there; on
+# the reasoning datasets (CogCoM/ReFocus/Zebra) 'both' also pressures the
+# answer span -- where do(Z) is measured. Default both (2026-09-07).
+SWAP_SPAN="${SWAP_SPAN:-both}"
 EPOCHS="${EPOCHS:-1}"
 NUM_SAMPLES="${NUM_SAMPLES:-32000}"          # pilot subset; unset/large for full run
+# --num_samples is a HEAD slice of the concatenated files and Visual_CoT alone is
+# 118K rows: without shuffling, a 32K pilot trains on Visual_CoT ONLY (zero
+# reasoning data). Shuffle with the fixed seed; hold out each file's last 500
+# rows so the gate's held-out slice is never trained on.
+HOLDOUT_TAIL="${HOLDOUT_TAIL:-500}"
 
 SAVE_CKPT="${SAVE_CKPT:-sft_stage3_decode${DECODE_WEIGHT}_latent${LATENT_SIZE}_pilot}"
 SAVE="/scratch/$USER/monet_ckpts/${SAVE_CKPT}"
@@ -106,7 +116,10 @@ torchrun --nproc-per-node="${NPROC:-8}" --master-port="${PORT:-29531}" -m src.ma
   --decode_weight "$DECODE_WEIGHT" \
   --swap_weight "$SWAP_WEIGHT" \
   --swap_margin "$SWAP_MARGIN" \
+  --swap_span "$SWAP_SPAN" \
   --obs_image_dropout "$OBS_IMAGE_DROPOUT" \
+  --shuffle_train \
+  --holdout_tail "$HOLDOUT_TAIL" \
   $OBS_MASK_ARG \
   $RECENTER_ARG \
   --num_samples "$NUM_SAMPLES" \

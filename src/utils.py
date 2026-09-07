@@ -35,6 +35,11 @@ def get_args():
     parser.add_argument("--grad_accum_steps", type=int, default=4, help="Gradient accumulation steps.")
     parser.add_argument("--epochs", type=int, default=10)  
     parser.add_argument("--shuffle_train", action='store_true', default=False, help="Whether to shuffle the training dataset.")
+    # Rows dropped from the END of EACH data file before concatenation/shuffling,
+    # so a held-out tail (gate_stage2 scores the last 300 rows of Visual_CoT) is
+    # never trained on even when --shuffle_train + --num_samples are used.
+    parser.add_argument("--holdout_tail", type=int, default=0,
+                        help="drop the last N rows of every --data_path file (holdout for the gate)")
 
     # ===== Monet arguments =====
     parser.add_argument("--alignment", type=str, default="observation_all", choices=["observation_end", "boxed_start", "observation_all"], help="The alignment strategy for Monet.")
@@ -1010,3 +1015,18 @@ def strip_observation_and_track_retokenized(
 
 if __name__=="__main__":
     pass
+
+def drop_tail(rows, n):
+    """The first len(rows)-n rows; n<=0 returns rows unchanged."""
+    return rows[:-n] if n and n > 0 and n < len(rows) else (rows[:0] if n and n >= len(rows) else rows)
+
+
+def dataset_mix(rows, key=lambda r: r.get("metadata", {}).get("dataset_name", "?")):
+    """{dataset_name: count} for a list of samples -- printed at startup so a
+    subset that silently collapsed onto one dataset (--num_samples is a HEAD
+    slice of the concatenation; Visual_CoT alone is 118K rows) is visible in the
+    first lines of the log instead of in the eval a day later."""
+    out = {}
+    for r in rows:
+        k = key(r); out[k] = out.get(k, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
