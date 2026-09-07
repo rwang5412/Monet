@@ -18,7 +18,8 @@ mkdir -p "$LOGDIR"
 cd "$VLME"
 echo "Judging do(Z) passes with DeepSeek (logs -> $LOGDIR) ..."
 for MODEL in $MODELS; do
-  for M in capture corrupt_mean corrupt_gauss; do
+  for M in ${MODES:-capture corrupt_mean corrupt_gauss swap}; do
+    [ -d "outputs/doz_$M/$MODEL" ] || continue
     printf "  %-22s %-14s ... " "$MODEL" "$M"
     find "outputs/doz_$M/$MODEL" -name "*_acc.csv" -o -name "*result.pkl" \
       -o -name "*result.xlsx" 2>/dev/null | xargs -r rm -f
