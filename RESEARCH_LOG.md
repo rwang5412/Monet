@@ -243,11 +243,34 @@ visible and `SWAP_WEIGHT=0.2` inert, the model re-learned that the image is the
 better source. This is the mechanism behind guard 1.000 / Δ 0.0 and it will
 recur in any stage-3 run without reader pressure under a visible image.
 
-**Free-gen do(Z) on this checkpoint (job 15482092) — NEVER RAN.** vLLM refused
-the checkpoint: `no module or parameter named 'latent_obs_decoder'` (see §6 ours
-#9). Repaired 2026-09-06 with `src.strip_aux_weights` (79 tensors / 381.6M
-params removed → `aux_weights.pt`); resubmitted as job 15608326. This is the
-baseline the 2-5% target is measured against.
+**Free-gen do(Z) on this checkpoint — the BASELINE for the 2-5% target.**
+First attempt (15482092) never ran: vLLM refused the checkpoint (`latent_obs_decoder`
+in the weights, §6 ours #9). Repaired with `src.strip_aux_weights`, re-run as
+15607807 (+ `swap` pass 15645482). Emission: 1501 latents captured ≈ 188/191
+samples × K=8. DeepSeek-judged, latent-step junk stripped (§6 ours #10/#11):
+
+| pass | V* accuracy | Δ vs clean | real text changed |
+|---|---|---|---|
+| clean | **0.665** | — | — |
+| corrupt_mean | 0.696 | +0.031 | 0.607 |
+| corrupt_gauss | 0.686 | +0.021 | 0.634 |
+| swap (donor) | _judge pending_ | | |
+
+**Verdict: COSMETIC** — destroying the latents costs nothing (the +2-3 points are
+noise), the same signature as released Monet — AND clean V* is **0.665 vs 0.806**
+for released Monet-SFT-7B: this run also lost ~14 points of accuracy. Both numbers
+are what the stage-3 v2 pilot must beat.
+
+**Format finding (matters for the whole design):** this checkpoint answers
+TERSELY in free generation — median 45 chars, no `\boxed{}`, observation language
+in 1% of samples (`red` / `The color of the paraglider is blue.`). Released
+Monet-SFT-7B writes a CoT with observations and a boxed answer. So for this
+checkpoint the chain latents → observation text → answer that L_swap (obs span)
+is built on **does not exist at inference**; only a direct latent→answer link
+does. If the pilot inherits this, L_swap on the obs span trains a span the model
+never generates and do(Z) cannot move → `SWAP_SPAN=both` becomes mandatory.
+Control still needed: the released model's free-gen format under this exact
+harness (capture pass on `Monet-SFT-7B-readme`, 20 min, 1 GPU).
 
 ---
 
@@ -334,6 +357,24 @@ harvested off-distribution. This is a finding about the paper, not our pipeline.
    an `aux_weights.pt` sidecar; `python -m src.strip_aux_weights --ckpt DIR`
    repairs checkpoints already on disk (in place, reversible, `--dry_run`).
 
+10. **The do(Z) scorer read the latent-step junk as the answer.** The vLLM runner
+    appends the token sampled at each of the K latent steps to the output text
+    (one short junk token + whitespace: `A   \n\n red`, `词汇      A. rubber`).
+    Every extractor takes the stray leading letter as the answer, so a checkpoint
+    that does not end with `\boxed{}` scores at chance: **0.31 raw vs 0.665
+    stripped** on the same predictions. Released Monet escaped only because
+    `\boxed{X}` wins over the junk. Also inflated `text-changed` to 1.000 (the
+    junk always differs); the real figure is ~0.6. Fixed: `928c256`/`92a20ab`
+    (`strip_latent_prefix.py`, run by `doz_report.sh` before judging; originals
+    kept as `*.raw.xlsx`). Proper fix is in the runner (don't emit those tokens) —
+    not done.
+11. **The "DeepSeek-judged" table was exact matching in disguise.** `.env` had no
+    key → VLMEvalKit hit `api.openai.com` with an empty key (`KeyError 'choices'`
+    ×6 per sample) and silently fell back to exact matching; the "judged" numbers
+    were identical to 4 decimals. `doz_report.sh` now refuses to run without a
+    key. The judge needs `OPENAI_API_KEY=<DeepSeek key>` and
+    `OPENAI_API_BASE=https://api.deepseek.com/v1/chat/completions` in `$VLME/.env`.
+
 **Pattern:** our bugs wasted GPU time (a silently dead loss burns hours and
 produces nothing); the upstream bugs matter scientifically.
 
@@ -402,9 +443,13 @@ lever that targets the reader under a VISIBLE image — L_swap with modality
 dropout (§9b) — has never been run at a weight that bites.
 
 **In flight:**
-- 15608326 `vlmeval_doz` — free-gen do(Z) + V* on the repaired old stage-3 ckpt
-  (`Monet-S3-ours`, K=8, DUMP=1). Establishes the baseline and proves the
-  eval path end-to-end.
+- DONE: do(Z) baseline on the old stage-3 ckpt (15607807 + swap 15645482):
+  clean 0.665, Δ ≈ +0.02/+0.03 → cosmetic (§5). do(Z) now has a `swap` mode
+  (`5da87a2`) — donor latents, the intervention L_swap trains against.
+- 15610129 `sft3_pilot` ABLATION — same 32K subset, `DECODE_WEIGHT=0 SWAP_WEIGHT=0
+  OBS_IMAGE_DROPOUT=0`. The only fair accuracy comparison for the pilot (its
+  clean V* will be low from the small budget alone).
+- 15610130 `harvest_s3` from v4 → `teacher_latents_v4/`, for the full run.
 - 15599688 `sft3_pilot` — **stage 3 v2 pilot**: `TARGETS=teacher_latents_v3`,
   `OBS_IMAGE_DROPOUT=0.5 SWAP_WEIGHT=1.0 SWAP_MARGIN=0.15`, L_dec 1.0, fixed
   alignment axis, 32K samples / 1 epoch (~2,000 steps, ~4h on H100). PENDING
@@ -412,7 +457,6 @@ dropout (§9b) — has never been run at a weight that bites.
   ~300 with `observation_token_acc` holding ~0.88 and `decode_gap` nonzero with
   a real donor. If `swap_gap_visible` ≤ 0.01 at step 500 → kill, relaunch at
   `SWAP_WEIGHT=3.0`.
-- (to submit) harvest from v4 → `teacher_latents_v4/`, for the full stage 3.
 
 **Artifacts on scratch:** `residual_mean.pt`; `teacher_reps_pos/neg/`;
 `teacher_latents_v3/` (124,165, from v3, correct budget); `teacher_latents_v2_stale/`
@@ -421,9 +465,14 @@ dropout (§9b) — has never been run at a weight that bites.
 stripped; `aux_weights.pt` alongside). NOTE: the stage-3 launcher's `TARGETS`
 default (`teacher_latents_modified`) no longer exists — always pass `TARGETS=`.
 
-**Sequence from here:** pilot result → gate it (both blocks) → free-gen do(Z) on
-it → if `swap_gap_visible` rose and Δ moved, full stage 3 on `teacher_latents_v4`
-with the validated `SWAP_WEIGHT` → do(Z) + V*.
+**Promotion rule for the full run on v4 targets:** do(Z) Δ ≤ −2% on the swap
+mode with guard OK, AND clean V* within ~1 pt of the matched ablation, AND
+emission rate ≥ the ablation's. Otherwise dial `SWAP_WEIGHT` (3.0) or
+`SWAP_SPAN=both` — not more stage 2.
+
+**Sequence from here:** pilot + ablation finish → check the pilot's free-gen
+FORMAT first (does it write observations?) → gate both → do(Z) on both
+(capture/mean/gauss/swap, DeepSeek-judged, junk stripped) → promotion rule above.
 
 ## 9b. Stage 3 v2 design — making causality survive a visible image (2026-09-03)
 
