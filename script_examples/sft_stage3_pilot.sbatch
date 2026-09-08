@@ -82,10 +82,14 @@ echo "targets OK: $TARGETS (found $first)"
 
 # Recentered alignment (mod A): compute the dataset-mean target once (cheap CPU),
 # then pass it to training. RECENTER=0 disables.
+# PRECOMPUTE THIS ON THE LOGIN NODE before submitting: inside the allocation it
+# idles 8 GPUs for the whole NFS read (job 15667375: 66 min, never trained).
+#   nohup python -m src.compute_target_mean --target_dir $TARGETS --stride 6 > mean.log 2>&1 &
 RECENTER="${RECENTER:-1}"
+MEAN_STRIDE="${MEAN_STRIDE:-6}"
 ALIGN_MEAN="$TARGETS/align_mean.pt"
 if [ "$RECENTER" = "1" ]; then
-  [ -f "$ALIGN_MEAN" ] || python -m src.compute_target_mean --target_dir "$TARGETS" --out "$ALIGN_MEAN"
+  [ -f "$ALIGN_MEAN" ] || python -m src.compute_target_mean --target_dir "$TARGETS" --out "$ALIGN_MEAN" --stride "$MEAN_STRIDE"
   RECENTER_ARG="--align_recenter_path $ALIGN_MEAN"
 else
   RECENTER_ARG=""
